@@ -25,7 +25,7 @@
 
 #pragma once
 
-// Uncomment below the graphics frameworks used by the layer.
+// 1. Target API Definitions
 
 #define XR_USE_GRAPHICS_API_D3D11
 #define XR_USE_GRAPHICS_API_D3D12
@@ -79,7 +79,7 @@ using Microsoft::WRL::ComPtr;
 // OpenXR loader interfaces.
 #include <loader_interfaces.h>
 
-// OpenXR/DirectX utilities.
+// 6. OpenXR/DirectX utilities
 #include <XrError.h>
 #include <XrMath.h>
 #include <XrSide.h>
@@ -87,7 +87,7 @@ using Microsoft::WRL::ComPtr;
 #include <XrToString.h>
 #include <DirectXCollision.h>
 
-// FMT formatter.
+// 7. FMT formatter & Utilities
 #include <fmt/format.h>
 
 #if defined(XR_USE_GRAPHICS_API_D3D11) || defined(XR_USE_GRAPHICS_API_D3D12)
