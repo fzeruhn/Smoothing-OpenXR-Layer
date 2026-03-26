@@ -26,11 +26,14 @@
 #pragma once
 
 // 1. Target API Definitions
-
 #define XR_USE_GRAPHICS_API_D3D11
 #define XR_USE_GRAPHICS_API_D3D12
+#define XR_USE_GRAPHICS_API_VULKAN
+#define VK_USE_PLATFORM_WIN32_KHR
+#define XR_USE_PLATFORM_WIN32
+#define XR_NO_PROTOTYPES
 
-// Standard library.
+// 2. Standard library
 #include <algorithm>
 #include <cstdarg>
 #include <ctime>
@@ -46,11 +49,10 @@
 #include <string>
 #include <memory>
 #include <optional>
-
 using namespace std::chrono_literals;
 
-// Windows header files.
-#define WIN32_LEAN_AND_MEAN             // Exclude rarely-used stuff from Windows headers
+// 3. Windows header files
+#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <unknwn.h>
@@ -58,25 +60,17 @@ using namespace std::chrono_literals;
 #include <wil/resource.h>
 #include <traceloggingactivity.h>
 #include <traceloggingprovider.h>
-
 using Microsoft::WRL::ComPtr;
 
-// Graphics APIs.
+// 4. Graphics APIs (MUST be included before OpenXR)
 #include <dxgiformat.h>
-#ifdef XR_USE_GRAPHICS_API_D3D11
 #include <d3d11_4.h>
-#endif
-#ifdef XR_USE_GRAPHICS_API_D3D12
 #include <d3d12.h>
-#endif
+#include <vulkan/vulkan.h>
 
-// OpenXR + Windows-specific definitions.
-#define XR_NO_PROTOTYPES
-#define XR_USE_PLATFORM_WIN32
+// 5. OpenXR
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-
-// OpenXR loader interfaces.
 #include <loader_interfaces.h>
 
 // 6. OpenXR/DirectX utilities
@@ -89,10 +83,5 @@ using Microsoft::WRL::ComPtr;
 
 // 7. FMT formatter & Utilities
 #include <fmt/format.h>
-
-#if defined(XR_USE_GRAPHICS_API_D3D11) || defined(XR_USE_GRAPHICS_API_D3D12)
-// Utilities framework.
 #include <utils/graphics.h>
-#endif
-
 #include <utils/inputs.h>
