@@ -101,8 +101,6 @@ scripts/
 ---
 
 ## Build & Dev Setup
-- MSBuild location: /c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe
-- Use the amd64 version for 64-bit builds
 
 ### Prerequisites
 1. **Visual Studio 2026** with C++ desktop workload + NuGet package manager
@@ -116,11 +114,30 @@ scripts/
 git submodule update --init --recursive
 ```
 
-### Build
-- Open `XR_APILAYER_NOVENDOR_template.sln` in Visual Studio 2026
-- NuGet packages restore automatically on first build (fmt, OpenXR.Headers, OpenXR.Loader, WIL)
+## Build System
+- Solution file: SMOOTHING-OPENXR-LAYER.sln (project root)
+- MSBuild must be invoked via powershell.exe due to Git Bash path handling
+- NuGet packages: fmt, OpenXR.Headers, OpenXR.Loader, WIL (restore automatically)
 - Build targets: Debug/Release × Win32/x64
-- Primary target: Release|x64
+- Primary output: bin\x64\Debug\ or bin\x64\Release\
+
+## Build Commands
+# Debug build
+powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' SMOOTHING-OPENXR-LAYER.sln /p:Configuration=Debug /p:Platform=x64 /m"
+
+# Release build
+powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' SMOOTHING-OPENXR-LAYER.sln /p:Configuration=Release /p:Platform=x64 /m"
+
+# Clean
+powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' SMOOTHING-OPENXR-LAYER.sln /t:Clean /p:Configuration=Debug /p:Platform=x64"
+
+## Known Warnings
+- LNK4099: PDB 'fmt.pdb' not found — benign, fmtd.lib ships without debug symbols. Ignore this.
+
+## Build Rules
+- Always build after making changes — never commit code that does not compile
+- Fix all errors before committing, warnings are acceptable
+- Run debug build for development, release build before merging to main
 
 ### Install & Test
 ```powershell
