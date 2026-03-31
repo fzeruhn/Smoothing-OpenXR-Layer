@@ -113,10 +113,6 @@ scripts/
 4. **NVOf SDK 5.0.7** — install from NVIDIA Optical Flow SDK
 
 ### First-time setup
-```powershell
-# Init git submodules (OpenXR-SDK, OpenXR-SDK-Source, OpenXR-MixedReality)
-git submodule update --init --recursive
-```
 
 ## Build System
 - Solution file: SMOOTHING-OPENXR-LAYER.sln (project root)
@@ -126,8 +122,6 @@ git submodule update --init --recursive
 - Primary output: bin\x64\Debug\ or bin\x64\Release\
 
 ## Build Commands
-# First time in any new worktree — run this before building:
-git submodule update --init --recursive
 
 # Debug build (always restore packages first)
 powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' SMOOTHING-OPENXR-LAYER.sln /p:Configuration=Debug /p:Platform=x64 /p:RestorePackages=true /m"
@@ -137,9 +131,6 @@ powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Communit
 
 # Clean
 powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' SMOOTHING-OPENXR-LAYER.sln /t:Clean /p:Configuration=Debug /p:Platform=x64"
-
-## Known Warnings
-- LNK4099: PDB 'fmt.pdb' not found — benign, fmtd.lib ships without debug symbols. Ignore this.
 
 ## Build Rules
 - Always build after making changes — never commit code that does not compile
