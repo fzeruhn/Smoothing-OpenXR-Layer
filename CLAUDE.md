@@ -122,6 +122,9 @@ git submodule update --init --recursive
 - Primary output: bin\x64\Debug\ or bin\x64\Release\
 
 ## Build Commands
+# First time in any new worktree — run this before building:
+git submodule update --init --recursive
+
 # Debug build (always restore packages first)
 powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' SMOOTHING-OPENXR-LAYER.sln /p:Configuration=Debug /p:Platform=x64 /p:RestorePackages=true /m"
 
