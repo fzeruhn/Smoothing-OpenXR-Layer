@@ -1,5 +1,9 @@
 # OpenXR Motion Smoothing Layer — Claude Context
 
+## Session Start Checklist
+
+At the start of every session, run `git submodule status`. If any line begins with `-`, the submodules are not initialized — run `git submodule update --init --recursive` before doing anything else. This is a known issue with new worktrees and will cause the pre-build code generation step to fail if skipped.
+
 ## Project Identity
 
 This is a custom OpenXR API layer implementing high-performance motion smoothing for VR. It sits between the OpenXR runtime and the application, intercepting `xrEndFrame` to synthesize intermediate frames before they reach the compositor. The goal is to meaningfully surpass ASW/SteamVR motion smoothing by fully exploiting Blackwell OFA, depth-guided warping, and foveated processing.
