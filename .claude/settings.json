@@ -1,0 +1,5 @@
+{
+  "env": {
+    "PATH": "/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin:/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64:${PATH}"
+  }
+}

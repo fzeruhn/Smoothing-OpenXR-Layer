@@ -101,6 +101,8 @@ scripts/
 ---
 
 ## Build & Dev Setup
+- MSBuild location: /c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe
+- Use the amd64 version for 64-bit builds
 
 ### Prerequisites
 1. **Visual Studio 2026** with C++ desktop workload + NuGet package manager
