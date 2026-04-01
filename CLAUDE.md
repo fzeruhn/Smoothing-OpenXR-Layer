@@ -44,13 +44,18 @@ Dependencies managed via NuGet (OpenXR headers/loader, fmt, WIL). CUDA and NVOf 
 - `xrEndFrame` — captures current color/depth VkImages, dispatches async GPU processing stub, maintains frame history (`m_prevColor`, `m_prevDepth`)
 - `VulkanFrameProcessor` — Vulkan command pool/buffer setup; compute pipeline is stubbed with TODOs
 
+**Implemented (vulkan_cuda_interop — Roadmap Item 1 complete):**
+- `SharedImage` — RAII wrapper; allocates VkImage with external memory flags, exports Win32 handle, imports into CUDA as `CUarray` mappable via surface objects
+- `SharedSemaphore` — RAII wrapper; creates VkSemaphore with export flags, imports into CUDA as `CUexternalSemaphore`; exposes `signal(stream)` / `wait(stream)`
+- Validated end-to-end by `interop-test`: CUDA kernel writes pattern to shared image, Vulkan reads back and verifies every pixel → **[PASS]**
+
 **Not yet implemented (stubs/TODOs):**
 - Vulkan compute pipeline in VulkanFrameProcessor
-- CUDA/OFA integration (NVOf SDK)
-- 6DoF pose capture and usage (pre-warp, LSR)
-- Depth acquisition (XR_KHR_composition_layer_depth or alternative)
-- Actual frame synthesis (warp, blend, hole fill)
-- Frame injection back to compositor via modified `xrEndFrame`
+- CUDA/OFA integration (NVOf SDK) — Roadmap Item 3
+- 6DoF pose capture and usage (pre-warp, LSR) — Roadmap Item 2
+- Depth acquisition (XR_KHR_composition_layer_depth or alternative) — Roadmap Item 5
+- Actual frame synthesis (warp, blend, hole fill) — Roadmap Items 4, 7, 9
+- Frame injection back to compositor via modified `xrEndFrame` — Roadmap Item 10
 
 ---
 
@@ -58,30 +63,35 @@ Dependencies managed via NuGet (OpenXR headers/loader, fmt, WIL). CUDA and NVOf 
 
 ```
 openxr-api-layer/
-  layer.cpp               Main layer logic — OpenXR hooks live here
-  layer.h                 Layer class definition
-  pch.h / pch.cpp         Precompiled headers
+  layer.cpp                    Main layer logic — OpenXR hooks live here
+  layer.h                      Layer class definition
+  vulkan_cuda_interop.h/.cpp   SharedImage + SharedSemaphore RAII wrappers (Roadmap Item 1)
+  pch.h / pch.cpp              Precompiled headers
   framework/
-    dispatch.h/.cpp       OpenXR function dispatch (template framework)
-    entry.cpp             DLL entry + loader negotiation (template framework)
-    log.h/.cpp            TraceLogging provider + macros
-    util.h                Formatting utilities (poses, FOV, vectors)
+    dispatch.h/.cpp            OpenXR function dispatch (template framework)
+    entry.cpp                  DLL entry + loader negotiation (template framework)
+    log.h/.cpp                 TraceLogging provider + macros
+    util.h                     Formatting utilities (poses, FOV, vectors)
   utils/
-    general.h/.cpp        General utilities — safe to use and extend
-    inputs.h / input.cpp  Input handling utilities
-    composition.cpp       Composition layer utilities
-    d3d11.cpp             DEAD CODE — template leftover, do not touch
-    d3d12.cpp             DEAD CODE — template leftover, do not touch
-    graphics.h            DEAD CODE — template leftover, do not touch
+    general.h/.cpp             General utilities — safe to use and extend
+    inputs.h / input.cpp       Input handling utilities
+    composition.cpp            Composition layer utilities
+    d3d11.cpp                  DEAD CODE — template leftover, do not touch
+    d3d12.cpp                  DEAD CODE — template leftover, do not touch
+    graphics.h                 DEAD CODE — template leftover, do not touch
+interop-test/
+  main.cpp                     Headless Vulkan + CUDA round-trip test harness
+  fill_pattern.cu              CUDA kernel + C-callable launcher
+  interop-test.vcxproj         Standalone console app; links cuda.lib + cudart.lib
 external/
-  OpenXR-SDK/             Khronos OpenXR SDK (submodule)
-  OpenXR-SDK-Source/      Khronos OpenXR SDK source (submodule)
-  OpenXR-MixedReality/    Microsoft OpenXR MixedReality (submodule)
-  PVR/                    Pimax SDK, to be used for better eye tracking data
+  OpenXR-SDK/                  Khronos OpenXR SDK (submodule)
+  OpenXR-SDK-Source/           Khronos OpenXR SDK source (submodule)
+  OpenXR-MixedReality/         Microsoft OpenXR MixedReality (submodule)
+  PVR/                         Pimax SDK, to be used for better eye tracking data
 scripts/
-  Install-Layer.ps1       Registers the layer in the Windows registry
-  Uninstall-Layer.ps1     Unregisters the layer
-  Tracing.wprp            WPR trace capture profile
+  Install-Layer.ps1            Registers the layer in the Windows registry
+  Uninstall-Layer.ps1          Unregisters the layer
+  Tracing.wprp                 WPR trace capture profile
 ```
 
 **New systems** (OFA, warpers, hole fill, frame pacing, etc.) should go in **new dedicated files**, not added to `layer.cpp`. `layer.cpp` should remain focused on OpenXR hook implementations that delegate to subsystem classes.
@@ -137,6 +147,14 @@ powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Communit
 - Always build after making changes — never commit code that does not compile
 - Fix all errors before committing, warnings are acceptable
 - Run debug build for development, release build before merging to main
+
+## interop-test Runtime Dependency
+`interop-test.exe` requires `cudart64_13.dll` at runtime (CUDA 13.x changed the DLL name from `cudart64_132.dll`). The DLL is **not** in the default PATH — copy it manually after first build:
+```
+copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64\cudart64_13.dll" bin\x64\Debug\
+copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64\cudart64_13.dll" bin\x64\Release\
+```
+Do **not** use `cudart_static.lib` in projects built with `/MDd` — the CRT mismatch (`/MT` vs `/MDd`) causes a pre-`main()` crash with no output.
 
 ### Install & Test
 ```powershell

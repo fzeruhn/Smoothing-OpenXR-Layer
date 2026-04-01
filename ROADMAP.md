@@ -4,7 +4,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 1. Vulkan/CUDA Interop Foundation
+## 1. Vulkan/CUDA Interop Foundation ✅ COMPLETE
 
 **Goal:** Prove that a VkImage can be shared with CUDA, written to by a compute shader or CUDA kernel, and read back correctly.
 
@@ -14,6 +14,8 @@ Each item is listed in dependency order. Complete earlier items before starting 
 - Import into CUDA as `CUexternalMemory`, map to `CUarray`
 - Create/export `VkSemaphore` for GPU sync, import as `CUexternalSemaphore`
 - Write a test: CUDA kernel fills image with a pattern, verify with Vulkan readback
+
+**Delivered:** `openxr-api-layer/vulkan_cuda_interop.h/.cpp` — `SharedImage` and `SharedSemaphore` RAII wrappers. `interop-test/` — standalone test exe confirming full round-trip on RTX 5070 Ti. `[PASS] Vulkan/CUDA interop verified (256x256 RGBA, pattern round-trip)`.
 
 **Why first:** Every subsequent system (OFA, warp, fill) depends on this interop pattern. Validate it in isolation before building anything on top of it.
 
