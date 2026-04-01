@@ -14,10 +14,10 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Forward declaration of the CUDA kernel (compiled in fill_pattern.cu).
+// Forward declaration of the kernel launcher (compiled in fill_pattern.cu).
+// The <<<>>> launch syntax is only valid in .cu files compiled by nvcc.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void fill_pattern(cudaSurfaceObject_t surf,
-                                        int width, int height);
+extern "C" void launch_fill_pattern(CUsurfObject surf, int width, int height);
 
 // ---------------------------------------------------------------------------
 // Minimal error-checking helpers
@@ -183,137 +183,141 @@ int main() {
 
     try {
         // 1. Initialise CUDA driver API.
+        // Use the primary context — cuCtxCreate signature changed in CUDA 13.x.
         CU(cuInit(0));
         CUdevice cuDev;
         CU(cuDeviceGet(&cuDev, 0));
         CUcontext cuCtx;
-        CU(cuCtxCreate(&cuCtx, 0, cuDev));
+        CU(cuDevicePrimaryCtxRetain(&cuCtx, cuDev));
+        CU(cuCtxSetCurrent(cuCtx));
 
         // 2. Create headless Vulkan context.
         VulkanContext vk = createVulkan();
 
-        // 3. Construct shared resources (throws on any setup failure).
-        interop::SharedImage     image(vk.device, vk.physDevice, W, H,
-                                       VK_FORMAT_R8G8B8A8_UNORM);
-        interop::SharedSemaphore sem(vk.device);
+        bool pass = false;
+        // Nested scope so image/sem/readback destructors fire before destroyVulkan.
+        {
+            // 3. Construct shared resources (throws on any setup failure).
+            interop::SharedImage     image(vk.device, vk.physDevice, W, H,
+                                           VK_FORMAT_R8G8B8A8_UNORM);
+            interop::SharedSemaphore sem(vk.device);
 
-        // 4. Create a CUDA surface object wrapping the shared CUarray.
-        CUDA_RESOURCE_DESC resDesc{};
-        resDesc.resType          = CU_RESOURCE_TYPE_ARRAY;
-        resDesc.res.array.hArray = image.cuArray();
-        CUsurfObject surf = 0;
-        CU(cuSurfObjectCreate(&surf, &resDesc));
+            // 4. Create a CUDA surface object wrapping the shared CUarray.
+            CUDA_RESOURCE_DESC resDesc{};
+            resDesc.resType          = CU_RESOURCE_TYPE_ARRAY;
+            resDesc.res.array.hArray = image.cuArray();
+            CUsurfObject surf = 0;
+            CU(cuSurfObjectCreate(&surf, &resDesc));
 
-        // 5. Launch the fill kernel on the default stream.
-        dim3 block(16, 16);
-        dim3 grid((W + 15) / 16, (H + 15) / 16);
-        fill_pattern<<<grid, block>>>(static_cast<cudaSurfaceObject_t>(surf),
-                                      W, H);
+            // 5. Launch the fill kernel on the default stream.
+            launch_fill_pattern(surf, W, H);
 
-        // 6. Signal the shared semaphore from CUDA so Vulkan can wait on it.
-        //    This enqueues the signal after the kernel on stream 0.
-        sem.signal(0);
+            // 6. Signal the shared semaphore from CUDA so Vulkan can wait on it.
+            //    This enqueues the signal after the kernel on stream 0.
+            sem.signal(0);
 
-        CU(cuSurfObjectDestroy(surf));
+            CU(cuSurfObjectDestroy(surf));
 
-        // 7. Allocate a host-visible readback buffer.
-        VkDeviceSize bufSize = static_cast<VkDeviceSize>(W) * H * 4;
+            // 7. Allocate a host-visible readback buffer.
+            VkDeviceSize bufSize = static_cast<VkDeviceSize>(W) * H * 4;
 
-        VkBufferCreateInfo bufInfo{};
-        bufInfo.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bufInfo.size        = bufSize;
-        bufInfo.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        VkBuffer readbackBuf;
-        VK(vkCreateBuffer(vk.device, &bufInfo, nullptr, &readbackBuf));
+            VkBufferCreateInfo bufInfo{};
+            bufInfo.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bufInfo.size        = bufSize;
+            bufInfo.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VkBuffer readbackBuf;
+            VK(vkCreateBuffer(vk.device, &bufInfo, nullptr, &readbackBuf));
 
-        VkMemoryRequirements bufMemReqs;
-        vkGetBufferMemoryRequirements(vk.device, readbackBuf, &bufMemReqs);
-        uint32_t memIdx = findHostVisibleMemType(vk.physDevice,
-                                                 bufMemReqs.memoryTypeBits);
-        VkMemoryAllocateInfo bufAlloc{};
-        bufAlloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        bufAlloc.allocationSize  = bufMemReqs.size;
-        bufAlloc.memoryTypeIndex = memIdx;
-        VkDeviceMemory readbackMem;
-        VK(vkAllocateMemory(vk.device, &bufAlloc, nullptr, &readbackMem));
-        VK(vkBindBufferMemory(vk.device, readbackBuf, readbackMem, 0));
+            VkMemoryRequirements bufMemReqs;
+            vkGetBufferMemoryRequirements(vk.device, readbackBuf, &bufMemReqs);
+            uint32_t memIdx = findHostVisibleMemType(vk.physDevice,
+                                                     bufMemReqs.memoryTypeBits);
+            VkMemoryAllocateInfo bufAlloc{};
+            bufAlloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            bufAlloc.allocationSize  = bufMemReqs.size;
+            bufAlloc.memoryTypeIndex = memIdx;
+            VkDeviceMemory readbackMem;
+            VK(vkAllocateMemory(vk.device, &bufAlloc, nullptr, &readbackMem));
+            VK(vkBindBufferMemory(vk.device, readbackBuf, readbackMem, 0));
 
-        // 8. Record: wait on CUDA semaphore, transition image, copy to buffer.
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK(vkBeginCommandBuffer(vk.cmdBuf, &beginInfo));
+            // 8. Record: wait on CUDA semaphore, transition image, copy to buffer.
+            VkCommandBufferBeginInfo beginInfo{};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            VK(vkBeginCommandBuffer(vk.cmdBuf, &beginInfo));
 
-        // Transition UNDEFINED → TRANSFER_SRC_OPTIMAL.
-        VkImageMemoryBarrier barrier{};
-        barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.srcAccessMask       = 0;
-        barrier.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
-        barrier.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image               = image.vkImage();
-        barrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdPipelineBarrier(vk.cmdBuf,
-                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+            // Transition UNDEFINED → TRANSFER_SRC_OPTIMAL.
+            VkImageMemoryBarrier barrier{};
+            barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask       = 0;
+            barrier.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image               = image.vkImage();
+            barrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(vk.cmdBuf,
+                                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-        VkBufferImageCopy region{};
-        region.bufferOffset      = 0;
-        region.bufferRowLength   = 0;
-        region.bufferImageHeight = 0;
-        region.imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageOffset       = {0, 0, 0};
-        region.imageExtent       = {static_cast<uint32_t>(W),
-                                    static_cast<uint32_t>(H), 1};
-        vkCmdCopyImageToBuffer(vk.cmdBuf,
-                               image.vkImage(),
-                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               readbackBuf, 1, &region);
+            VkBufferImageCopy region{};
+            region.bufferOffset      = 0;
+            region.bufferRowLength   = 0;
+            region.bufferImageHeight = 0;
+            region.imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageOffset       = {0, 0, 0};
+            region.imageExtent       = {static_cast<uint32_t>(W),
+                                        static_cast<uint32_t>(H), 1};
+            vkCmdCopyImageToBuffer(vk.cmdBuf,
+                                   image.vkImage(),
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   readbackBuf, 1, &region);
 
-        VK(vkEndCommandBuffer(vk.cmdBuf));
+            VK(vkEndCommandBuffer(vk.cmdBuf));
 
-        // Submit: Vulkan waits for the CUDA semaphore signal before the copy runs.
-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        VkSemaphore          waitSem   = sem.vkSemaphore();
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores    = &waitSem;
-        submitInfo.pWaitDstStageMask  = &waitStage;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers    = &vk.cmdBuf;
-        VK(vkQueueSubmit(vk.queue, 1, &submitInfo, VK_NULL_HANDLE));
-        VK(vkQueueWaitIdle(vk.queue));
+            // Submit: Vulkan waits for the CUDA semaphore signal before the copy runs.
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSemaphore          waitSem   = sem.vkSemaphore();
+            VkSubmitInfo submitInfo{};
+            submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores    = &waitSem;
+            submitInfo.pWaitDstStageMask  = &waitStage;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers    = &vk.cmdBuf;
+            VK(vkQueueSubmit(vk.queue, 1, &submitInfo, VK_NULL_HANDLE));
+            VK(vkQueueWaitIdle(vk.queue));
 
-        // 9. Map and verify every pixel.
-        void* mapped = nullptr;
-        VK(vkMapMemory(vk.device, readbackMem, 0, bufSize, 0, &mapped));
-        auto* pixels = reinterpret_cast<unsigned char*>(mapped);
+            // 9. Map and verify every pixel.
+            void* mapped = nullptr;
+            VK(vkMapMemory(vk.device, readbackMem, 0, bufSize, 0, &mapped));
+            auto* pixels = reinterpret_cast<unsigned char*>(mapped);
 
-        bool pass = true;
-        for (int y = 0; y < H && pass; ++y) {
-            for (int x = 0; x < W && pass; ++x) {
-                int     idx  = (y * W + x) * 4;
-                uint8_t expR = static_cast<uint8_t>((x + y * W) % 256);
-                uint8_t gotR = pixels[idx];
-                if (gotR != expR) {
-                    printf("[FAIL] Pixel (%d,%d): expected R=%u, got R=%u\n",
-                           x, y, expR, gotR);
-                    pass = false;
+            pass = true;
+            for (int y = 0; y < H && pass; ++y) {
+                for (int x = 0; x < W && pass; ++x) {
+                    int     idx  = (y * W + x) * 4;
+                    uint8_t expR = static_cast<uint8_t>((x + y * W) % 256);
+                    uint8_t gotR = pixels[idx];
+                    if (gotR != expR) {
+                        printf("[FAIL] Pixel (%d,%d): expected R=%u, got R=%u\n",
+                               x, y, expR, gotR);
+                        pass = false;
+                    }
                 }
             }
-        }
-        vkUnmapMemory(vk.device, readbackMem);
+            vkUnmapMemory(vk.device, readbackMem);
 
-        // 10. Cleanup.
-        vkFreeMemory(vk.device, readbackMem, nullptr);
-        vkDestroyBuffer(vk.device, readbackBuf, nullptr);
+            // 10. Cleanup readback resources (image/sem destroy when scope closes).
+            vkFreeMemory(vk.device, readbackMem, nullptr);
+            vkDestroyBuffer(vk.device, readbackBuf, nullptr);
+        } // image and sem destructors fire here, before destroyVulkan
+
         destroyVulkan(vk);
-        cuCtxDestroy(cuCtx);
+        cuDevicePrimaryCtxRelease(cuDev);
 
         if (pass) {
             printf("[PASS] Vulkan/CUDA interop verified (%dx%d RGBA, "
