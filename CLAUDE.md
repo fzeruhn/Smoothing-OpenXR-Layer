@@ -77,6 +77,7 @@ external/
   OpenXR-SDK/             Khronos OpenXR SDK (submodule)
   OpenXR-SDK-Source/      Khronos OpenXR SDK source (submodule)
   OpenXR-MixedReality/    Microsoft OpenXR MixedReality (submodule)
+  PVR/                    Pimax SDK, to be used for better eye tracking data
 scripts/
   Install-Layer.ps1       Registers the layer in the Windows registry
   Uninstall-Layer.ps1     Unregisters the layer
