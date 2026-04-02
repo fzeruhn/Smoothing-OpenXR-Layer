@@ -8,3 +8,4 @@ bin/
 *.vcxproj.user
 *.csproj.user
 .claude/worktrees/
+docs/superpowers
