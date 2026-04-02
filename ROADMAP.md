@@ -36,7 +36,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 3. OFA Integration
+## 3. OFA Integration ✅ COMPLETE
 
 **Goal:** Feed two VkImages to NVIDIA Optical Flow and get back a motion vector field.
 
