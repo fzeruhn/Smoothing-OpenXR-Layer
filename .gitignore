@@ -8,6 +8,7 @@ bin/
 *.vcxproj.user
 *.csproj.user
 .claude/worktrees/
+docs/superpowers
 
 # Test output artifacts
 ofa-test-output.png
