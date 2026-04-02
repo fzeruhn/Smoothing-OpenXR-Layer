@@ -70,6 +70,8 @@ public:
 
     OFAPipeline(const OFAPipeline&)            = delete;
     OFAPipeline& operator=(const OFAPipeline&) = delete;
+    OFAPipeline(OFAPipeline&&)                 = delete;
+    OFAPipeline& operator=(OFAPipeline&&)      = delete;
 
     // Upload an 8-bit grayscale host frame into the named slot.
     //   slot 0 = inputFrame     (current / new frame)

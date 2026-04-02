@@ -63,6 +63,14 @@ Dependencies managed via NuGet (OpenXR headers/loader, fmt, WIL). CUDA and NVOf 
 - Actual frame synthesis (warp, blend, hole fill) — Roadmap Items 4, 7, 9
 - Frame injection back to compositor via modified `xrEndFrame` — Roadmap Item 10
 
+**OFA Pipeline: Deferred Optimizations (Future Items 4+)**
+
+The current `OFAPipeline` is validated as a standalone, synchronous component. For VR integration, the following architectural improvements are planned but deferred to Items 4+ (pre-warp, frame synthesis):
+
+- **Async Memory Copies:** Item 4 will switch from `cuMemcpy2D` (blocking) to `cuMemcpy2DAsync` with CUDA streams to keep GPU work overlapped with CPU work during the 11ms frame budget.
+- **Variable Input Pitch:** Item 4 will add a `hostPitch` parameter to `loadFrame()` to handle Vulkan swapchain texture padding/stride, instead of assuming tightly-packed host data.
+- **Zero-Copy GPU Pipeline:** Items 6-7 will bypass `loadFrame()` entirely and feed Vulkan textures directly into OFA via CUDA/Vulkan interop (`cudaGraphicsResource`), keeping frames GPU-resident throughout the pipeline.
+
 ---
 
 ## File Map
