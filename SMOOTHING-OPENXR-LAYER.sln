@@ -7,6 +7,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "openxr-api-layer", "openxr-
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "interop-test", "interop-test\interop-test.vcxproj", "{1A2B3C4D-5E6F-7A8B-9C0D-E1F2A3B4C5D6}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ofa-test", "ofa-test\ofa-test.vcxproj", "{B0BF0CBD-40A8-43D8-A928-6840C6609939}"
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Files", "Solution Files", "{A53ED6CB-95D3-4833-8A16-C6A588F16F6E}"
 	ProjectSection(SolutionItems) = preProject
 		.clang-format = .clang-format
@@ -47,6 +49,10 @@ Global
 		{1A2B3C4D-5E6F-7A8B-9C0D-E1F2A3B4C5D6}.Release|x64.ActiveCfg = Release|x64
 		{1A2B3C4D-5E6F-7A8B-9C0D-E1F2A3B4C5D6}.Release|x64.Build.0 = Release|x64
 		{1A2B3C4D-5E6F-7A8B-9C0D-E1F2A3B4C5D6}.Release|Win32.ActiveCfg = Release|x64
+		{B0BF0CBD-40A8-43D8-A928-6840C6609939}.Debug|x64.ActiveCfg = Debug|x64
+		{B0BF0CBD-40A8-43D8-A928-6840C6609939}.Debug|x64.Build.0 = Debug|x64
+		{B0BF0CBD-40A8-43D8-A928-6840C6609939}.Release|x64.ActiveCfg = Release|x64
+		{B0BF0CBD-40A8-43D8-A928-6840C6609939}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
