@@ -8,8 +8,6 @@
 // referenceFrame=frame0, the forward flow for an interior block is (-8, -4) px
 // = (-256, -128) in S10.5 fixed-point (divide by 32.0f to get pixels).
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
 
 #include "ofa_pipeline.h"
 
@@ -155,23 +153,6 @@ int main() {
                            first_fail_fy, EXPECTED_FY);
             }
 
-            // -----------------------------------------------------------------------
-            // PNG output: red = X flow, green = Y flow (+/-16px range -> 0-255)
-            // -----------------------------------------------------------------------
-            std::vector<uint8_t> img(OUT_W * OUT_H * 3);
-            for (int i = 0; i < OUT_W * OUT_H; ++i) {
-                float fx = vectors[i].flowx / 32.0f;  // S10.5 -> pixels
-                float fy = vectors[i].flowy / 32.0f;
-                auto encode = [](float v) -> uint8_t {
-                    float norm = (v + 16.0f) / 32.0f;  // map [-16,+16] px -> [0,1]
-                    return static_cast<uint8_t>(std::clamp(norm * 255.0f, 0.0f, 255.0f));
-                };
-                img[i * 3 + 0] = encode(fx);
-                img[i * 3 + 1] = encode(fy);
-                img[i * 3 + 2] = 0;
-            }
-            stbi_write_png("ofa-test-output.png", OUT_W, OUT_H, 3, img.data(), OUT_W * 3);
-            printf("ofa-test-output.png written (%dx%d)\n", OUT_W, OUT_H);
         } // OFAPipeline destructor runs here — context still valid
 
     } catch (const std::exception& e) {
