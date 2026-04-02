@@ -8,3 +8,7 @@ bin/
 *.vcxproj.user
 *.csproj.user
 .claude/worktrees/
+
+# Test output artifacts
+ofa-test-output.png
+interop-test-output.*

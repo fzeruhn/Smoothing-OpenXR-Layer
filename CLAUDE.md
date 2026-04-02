@@ -49,9 +49,15 @@ Dependencies managed via NuGet (OpenXR headers/loader, fmt, WIL). CUDA and NVOf 
 - `SharedSemaphore` — RAII wrapper; creates VkSemaphore with export flags, imports into CUDA as `CUexternalSemaphore`; exposes `signal(stream)` / `wait(stream)`
 - Validated end-to-end by `interop-test`: CUDA kernel writes pattern to shared image, Vulkan reads back and verifies every pixel → **[PASS]**
 
+**Implemented (ofa_pipeline — Roadmap Item 3 complete):**
+- `OFAPipeline` — RAII wrapper around NvOF 5.0.7 C API; loads `nvofapi64.dll` dynamically, creates OFA instance, allocates GPU buffers, runs optical flow estimation
+- `loadFrame(slot, hostGray8)` — uploads 8-bit grayscale frame to OFA input buffer (slot 0 = inputFrame/current, slot 1 = referenceFrame/previous)
+- `execute()` — runs `nvOFExecute` and copies output motion vectors to host staging buffer; caller must `cuCtxSynchronize()` before reading `outputData()`
+- Validated end-to-end by `ofa-test`: 256×256 random-noise frames with deterministic +8px/+4px shift; 2500/2500 central vectors within ±2 S10.5 units → **[PASS]**
+- **NvOF FORWARD convention:** output vectors give displacement from `inputFrame` → `referenceFrame` (NOT reference → input). Expected flow for a +8,+4px shift with current=inputFrame is (-256, -128) in S10.5.
+
 **Not yet implemented (stubs/TODOs):**
 - Vulkan compute pipeline in VulkanFrameProcessor
-- CUDA/OFA integration (NVOf SDK) — Roadmap Item 3
 - 6DoF pose capture and usage (pre-warp, LSR) — Roadmap Item 2
 - Depth acquisition (XR_KHR_composition_layer_depth or alternative) — Roadmap Item 5
 - Actual frame synthesis (warp, blend, hole fill) — Roadmap Items 4, 7, 9
@@ -83,6 +89,10 @@ interop-test/
   main.cpp                     Headless Vulkan + CUDA round-trip test harness
   fill_pattern.cu              CUDA kernel + C-callable launcher
   interop-test.vcxproj         Standalone console app; links cuda.lib + cudart.lib
+ofa-test/
+  main.cpp                     OFA end-to-end test: random noise frames, shift validation, PNG output
+  stb_image_write.h            Header-only PNG writer
+  ofa-test.vcxproj             Standalone console app; uses CUDA 13.2 build customizations
 external/
   OpenXR-SDK/                  Khronos OpenXR SDK (submodule)
   OpenXR-SDK-Source/           Khronos OpenXR SDK source (submodule)
@@ -148,13 +158,27 @@ powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Communit
 - Fix all errors before committing, warnings are acceptable
 - Run debug build for development, release build before merging to main
 
-## interop-test Runtime Dependency
-`interop-test.exe` requires `cudart64_13.dll` at runtime (CUDA 13.x changed the DLL name from `cudart64_132.dll`). The DLL is **not** in the default PATH — copy it manually after first build:
+## Running the standalone tests
+
+Both test exes live in `bin\x64\Debug\` (or `Release\`) and are run directly from the solution root:
+
+```
+bin\x64\Debug\interop-test.exe   # Vulkan/CUDA interop round-trip
+bin\x64\Debug\ofa-test.exe       # OFA optical flow end-to-end
+```
+
+`ofa-test.exe` writes `ofa-test-output.png` to the current directory (color-coded flow field, red=X, green=Y, ±16px range).
+
+### cudart64_13.dll
+Both test exes require `cudart64_13.dll` at runtime. The DLL is **not** in the default PATH — copy it manually after the first build:
 ```
 copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64\cudart64_13.dll" bin\x64\Debug\
 copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64\cudart64_13.dll" bin\x64\Release\
 ```
 Do **not** use `cudart_static.lib` in projects built with `/MDd` — the CRT mismatch (`/MT` vs `/MDd`) causes a pre-`main()` crash with no output.
+
+### nvofapi64.dll
+`ofa-test.exe` loads `nvofapi64.dll` at runtime via `LoadLibraryA`. This DLL ships with the NVIDIA driver and lives in `C:\Windows\System32\` — no manual copying needed.
 
 ### Install & Test
 ```powershell
