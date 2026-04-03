@@ -96,7 +96,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 7. Bidirectional Frame Synthesis
+## 7. Bidirectional Frame Synthesis ✅ COMPLETE
 
 **Goal:** Given frame N, frame N+1, motion vectors, and depth, synthesize a frame at T+0.5.
 
