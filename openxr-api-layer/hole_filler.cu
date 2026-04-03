@@ -22,18 +22,6 @@
 #include <algorithm>
 
 // ---------------------------------------------------------------------------
-// Runtime-API error check (local to this translation unit)
-// ---------------------------------------------------------------------------
-
-#define CHECK_RT(call)                                                            \
-    do {                                                                          \
-        cudaError_t _e = (call);                                                  \
-        if (_e != cudaSuccess)                                                    \
-            throw std::runtime_error(std::string("CUDA runtime: ") +             \
-                                     cudaGetErrorString(_e));                     \
-    } while (0)
-
-// ---------------------------------------------------------------------------
 // File-local helpers — surface and texture object creation
 // ---------------------------------------------------------------------------
 
