@@ -21,6 +21,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cmath>
 #include <vector>
