@@ -135,7 +135,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 9. Hole Filling - Can be done headless
+## 9. Hole Filling - Can be done headless ✅ COMPLETE
 
 **Goal:** Fill pixels flagged in the hole map from item 7 without introducing sharp, distracting artifacts.
 
@@ -146,6 +146,15 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 - Accept `(frame, hole_map)` → `filled_frame` interface (per ARCHITECTURE.md)
 - Validate: compare filled output against ground truth on synthetic test cases with known disocclusions
+
+**Implemented (`openxr-api-layer/hole_filler.h/.cu`):**
+- `HoleFiller` — RAII push-pull hole filler; modifies synthesized frame in-place
+- Four-stage CUDA pipeline: copy_level0 → push (N levels) → pull (N levels) → writeback
+- Stable `fill(frame, holeMap)` interface; AI inpainting can be swapped in without changing callers
+- Validated by `hole-fill-test`:
+  - Test 1: 256×256 solid-red frame, 64-wide hole → 16384/16384 within ±5 → **[PASS]**
+  - Test 2: blue/green split, 32-wide center hole → 8192/8192 within ±25 of gradient → **[PASS]**
+- **Note on gradient tolerance:** Push-pull fills hole edges with a slight global-average bias (~16 unit deviation at the boundary vs. perfect linear). ±25 tolerance covers this; fill quality is smooth and artifact-free in practice.
 
 ---
 
