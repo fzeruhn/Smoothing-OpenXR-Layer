@@ -4,14 +4,14 @@
 //   Test 1 — Solid-color frame with 64-wide center hole strip:
 //     Frame:   256×256 all-red (255, 0, 0, 255)
 //     HoleMap: columns 96–159 = 255 (hole), rest = 0 (valid)
-//     Expected: all former hole pixels filled with red, within ±5/channel
-//     Criterion: 100% of hole pixels within ±5/channel of (255, 0, 0)
+//     Expected: all former hole pixels filled with red, within +/-5/channel
+//     Criterion: 100% of hole pixels within +/-5/channel of (255, 0, 0)
 //
 //   Test 2 — Two-color frame with 32-wide center hole:
 //     Frame:   cols 0–127 blue (0,0,255,255), cols 128–255 green (0,255,0,255)
 //     HoleMap: columns 112–143 = 255 (hole), rest = 0 (valid)
 //     Expected: hole pixels interpolate from blue→green across the strip
-//     Criterion: all hole pixels within ±15/channel of linear blue→green gradient
+//     Criterion: all hole pixels within +/-15/channel of linear blue→green gradient
 //
 // Both tests require frame and holeMap arrays allocated with
 // CUDA_ARRAY3D_SURFACE_LDST, matching the FrameSynthesizer output contract.
@@ -163,7 +163,7 @@ int main()
 
                 const auto result = downloadRGBA8(frame);
 
-                // All originally-hole pixels must be red within ±5/channel.
+                // All originally-hole pixels must be red within +/-5/channel.
                 int failures  = 0;
                 int holeCount = 0;
                 int firstFailX = -1, firstFailY = -1;
@@ -189,7 +189,7 @@ int main()
                 t1pass = (failures == 0);
                 if (t1pass) {
                     printf("[PASS] Test 1 (solid red, 64-wide hole): "
-                           "%d/%d hole pixels within ±5\n",
+                           "%d/%d hole pixels within +/-5\n",
                            holeCount, holeCount);
                 } else {
                     printf("[FAIL] Test 1: %d/%d hole pixels out of tolerance\n",
@@ -266,7 +266,7 @@ int main()
                 t2pass = (failures == 0);
                 if (t2pass) {
                     printf("[PASS] Test 2 (blue/green split, 32-wide hole): "
-                           "%d/%d hole pixels within ±25 of gradient\n",
+                           "%d/%d hole pixels within +/-25 of gradient\n",
                            holeCount, holeCount);
                 } else {
                     printf("[FAIL] Test 2: %d/%d hole pixels out of tolerance\n",
