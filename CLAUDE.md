@@ -56,12 +56,19 @@ Dependencies managed via NuGet (OpenXR headers/loader, fmt, WIL). CUDA and NVOf 
 - Validated end-to-end by `ofa-test`: 256×256 random-noise frames with deterministic +8px/+4px shift; 2500/2500 central vectors within ±2 S10.5 units → **[PASS]**
 - **NvOF FORWARD convention:** output vectors give displacement from `inputFrame` → `referenceFrame` (NOT reference → input). Expected flow for a +8,+4px shift with current=inputFrame is (-256, -128) in S10.5.
 
+**Implemented (frame_synthesizer — Roadmap Item 7 complete):**
+- `FrameSynthesizer` — RAII wrapper around bidirectional frame synthesis (atomic scatter + bilinear gather)
+- Two-pass CUDA pipeline: depth-sorted atomic scatter (closest depth wins) → bilinear gather + 50/50 blend
+- Validated end-to-end by `synthesis-test`: 256×256 checkerboard +16/+8 px translation, 100% central pixels within ±2/channel → **[PASS]**
+- **Known integration point — Reversed-Z depth:** Most modern engines (including likely Star Citizen) use Reversed-Z depth for precision (1.0 = near, 0.0 = far). The scatter kernel assumes standard depth (0.0 = near). If depth acquisition yields inverted visuals (background occludes foreground), invert depth in `kernel_scatter`: `depth = 1.0f - depth` before packing. This is a **TODO for live integration testing**.
+
 **Not yet implemented (stubs/TODOs):**
 - Vulkan compute pipeline in VulkanFrameProcessor
 - 6DoF pose capture and usage (pre-warp, LSR) — Roadmap Item 2
 - Depth acquisition (XR_KHR_composition_layer_depth or alternative) — Roadmap Item 5
-- Actual frame synthesis (warp, blend, hole fill) — Roadmap Items 4, 7, 9
+- Pre-OFA pose pre-warp (homography) — Roadmap Item 4
 - Frame injection back to compositor via modified `xrEndFrame` — Roadmap Item 10
+- Hole filling (edge-directed interpolation) — Roadmap Item 9
 
 **OFA Pipeline: Deferred Optimizations (Future Items 4+)**
 
@@ -80,6 +87,7 @@ openxr-api-layer/
   layer.cpp                    Main layer logic — OpenXR hooks live here
   layer.h                      Layer class definition
   vulkan_cuda_interop.h/.cpp   SharedImage + SharedSemaphore RAII wrappers (Roadmap Item 1)
+  frame_synthesizer.h/.cu      FrameSynthesizer RAII + CUDA kernels (Roadmap Item 7)
   pch.h / pch.cpp              Precompiled headers
   framework/
     dispatch.h/.cpp            OpenXR function dispatch (template framework)
@@ -101,6 +109,9 @@ ofa-test/
   main.cpp                     OFA end-to-end test: random noise frames, shift validation, PNG output
   stb_image_write.h            Header-only PNG writer
   ofa-test.vcxproj             Standalone console app; uses CUDA 13.2 build customizations
+synthesis-test/
+  main.cpp                     Bidirectional synthesis end-to-end test: checkerboard +16/+8 shift, validation
+  synthesis-test.vcxproj       Standalone console app; uses CUDA 13.2 build customizations
 external/
   OpenXR-SDK/                  Khronos OpenXR SDK (submodule)
   OpenXR-SDK-Source/           Khronos OpenXR SDK source (submodule)
