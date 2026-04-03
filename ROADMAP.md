@@ -21,6 +21,16 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
+## 1.5. OpenXR Data Pipeline - Partially complete
+
+**Goal:** Get all informarion that will be needed for later calculations from openxr, and do any nessecary calculations to make it usable
+
+**Work:**
+- Hook OpenXR (xrLocateViews) to extract the headset's physical FOV (parsing XrFovf to account for asymmetric/canted displays).
+- TODO: fill out
+
+---
+
 ## 2. 6DoF Pose Data Pipeline
 
 **Goal:** Reliably capture render-time pose and display-time pose at each `xrEndFrame`, and make them available to downstream systems.
@@ -52,13 +62,13 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 4. Pre-OFA Pose Pre-warp
+## 4. Pre-OFA Pose Pre-warp - Can be done headless
 
 **Goal:** Apply pose delta to frame N−1 before feeding to OFA, so that OFA sees only scene-relative motion.
 
 **Work:**
 - Compute homography matrix from `pose_delta` (from item 2) and camera intrinsics (FOV from `xrEndFrame`)
-- Apply homography warp to previous frame as a Vulkan compute pass before OFA execution
+- Apply homography warp to previous frame as a CUDA kernel (to keep memory in the current execution context) before OFA execution
 - Compare OFA vector field quality with and without pre-warp (smoother, smaller magnitude in static scenes)
 
 **Why fourth:** Improves OFA quality across the whole pipeline. Build on top of validated OFA from item 3.
@@ -111,24 +121,29 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 8. Stereo Vector Adaptation
+## 8. Stereo Vector Adaptation - Can be done headless
 
 **Goal:** Derive right-eye motion vectors from left-eye OFA output.
 
 **Work:**
-- Apply IPD offset transform to left-eye vectors: horizontal shift corresponding to eye separation distance
-- Optional: small perspective correction based on depth
+- Derive focal length (f) from the acquired horizontal FOV
+- Calculate binocular disparity per pixel using the depth map
+- Apply calculated disparity offset to shift left-eye vectors to the right eye
+- Apply perspective correction and handle disocclusion/overlap based on depth
 - Validate: compare adapted right-eye vectors to a direct right-eye OFA run (run OFA on both eyes in test mode, measure error)
 - Tune transform until adapted vectors are within acceptable error margin
 
 ---
 
-## 9. Hole Filling
+## 9. Hole Filling - Can be done headless
 
-**Goal:** Fill pixels flagged in the hole map from item 7.
+**Goal:** Fill pixels flagged in the hole map from item 7 without introducing sharp, distracting artifacts.
 
 **Work:**
-- Implement edge-directed interpolation compute shader: for each hole pixel, sample valid neighbors with weights biased along detected edges
+- Implement a Hierarchical Push-Pull CUDA kernel:
+- Push (Downsample): Generate a mipmap chain of the frame, ignoring pixels flagged in the hole map.
+- Pull (Upsample): Traverse back up the mipmap chain, blending the lower-resolution valid colors exclusively into the hole map pixels.
+
 - Accept `(frame, hole_map)` → `filled_frame` interface (per ARCHITECTURE.md)
 - Validate: compare filled output against ground truth on synthetic test cases with known disocclusions
 
@@ -180,3 +195,4 @@ Each item is listed in dependency order. Complete earlier items before starting 
 - **AI inpainting slot:** Replace math hole fill (item 9) with a small inpainting model. Interface is stable — no pipeline restructure needed.
 - **Star Citizen depth extraction:** If the preferred paths (item 5) prove insufficient, invest in game-specific depth acquisition.
 - **Per-frame quality metrics:** Automated SSIM / LPIPS comparison between synthesized frames and ground-truth interpolations for regression testing.
+- **Auto IPD getting:** Get IPD from headset API / SDK to automatically do the stero vector adaptation without user input IPD
