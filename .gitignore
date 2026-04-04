@@ -9,6 +9,7 @@ bin/
 *.csproj.user
 .claude/worktrees/
 docs/superpowers
+*.png
 
 # Test output artifacts
 ofa-test-output.png
