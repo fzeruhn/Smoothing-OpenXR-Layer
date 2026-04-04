@@ -54,8 +54,8 @@ static constexpr float FAR_PLANE = 100.0f;
 // Linearization formula: depth_linear = (near * far) / (far - depth_ndc * (far - near))
 // Foreground: 0.5m → reversed-Z ≈ 0.9
 // Background: 5.0m → reversed-Z ≈ 0.1
-static constexpr float DEPTH_FOREGROUND = 0.9f; // Close (0.5m)
-static constexpr float DEPTH_BACKGROUND = 0.1f; // Far (5.0m)
+static constexpr float DEPTH_FOREGROUND = 0.1f; // Close (0.1m)
+static constexpr float DEPTH_BACKGROUND = 0.9f; // Far (1.0m)
 
 // Motion vectors (horizontal motion +16px = 512 in S10.5)
 static constexpr int16_t MOTION_X = 512;  // +16px * 32
@@ -93,7 +93,8 @@ int main()
     }
 
     CUcontext ctx = nullptr;
-    cuErr = cuCtxCreate(&ctx, 0, dev);
+    CUctxCreateParams ctxParams{};
+    cuErr = cuCtxCreate(&ctx, &ctxParams, 0, dev);
     if (cuErr != CUDA_SUCCESS) {
         fprintf(stderr, "[FAIL] cuCtxCreate: %d\n", cuErr);
         return EXIT_FAILURE;
@@ -187,18 +188,28 @@ int main()
         printf("\nHole map: %zu / %zu pixels marked as holes (%.1f%%)\n",
                holeCount, (size_t)(W * H), 100.0f * holeCount / (W * H));
 
-        // Sample right-eye vectors at center of foreground and background regions
-        // Foreground: x=64 (left half), y=128 (center)
-        // Background: x=192 (right half), y=128 (center)
-        uint32_t idx_fg = 128 * W + 64;
-        uint32_t idx_bg = 128 * W + 192;
+        // Sample right-eye vectors at valid (non-hole) pixels in each depth region
+        const uint32_t sampleY = H / 2;
+        auto findValidX = [&](uint32_t xBegin, uint32_t xEnd) -> uint32_t {
+            for (uint32_t x = xBegin; x < xEnd; ++x) {
+                if (h_holeMap[sampleY * W + x] == 0) {
+                    return x;
+                }
+            }
+            return (xBegin + xEnd) / 2;
+        };
+
+        uint32_t x_fg = findValidX(0, W / 2);
+        uint32_t x_bg = findValidX(W / 2, W);
+        uint32_t idx_fg = sampleY * W + x_fg;
+        uint32_t idx_bg = sampleY * W + x_bg;
 
         float2 vec_fg = h_rightVectors[idx_fg];
         float2 vec_bg = h_rightVectors[idx_bg];
 
         printf("\nSampled right-eye vectors:\n");
-        printf("  Foreground (x=64,  y=128): (%.1f, %.1f)\n", vec_fg.x, vec_fg.y);
-        printf("  Background (x=192, y=128): (%.1f, %.1f)\n", vec_bg.x, vec_bg.y);
+        printf("  Foreground (x=%u, y=%u): (%.1f, %.1f)\n", x_fg, sampleY, vec_fg.x, vec_fg.y);
+        printf("  Background (x=%u, y=%u): (%.1f, %.1f)\n", x_bg, sampleY, vec_bg.x, vec_bg.y);
 
         // Validation checks
         bool pass = true;

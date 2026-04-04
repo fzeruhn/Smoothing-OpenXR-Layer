@@ -369,26 +369,8 @@ namespace openxr_api_layer {
                                                       TLArg(m_fovRight.angleDown, "RightEye_AngleDown"));
                                 }
 
-                                // Initialize stereo adapter when we have both FOV and swapchain resolution
-                                if (!m_stereoAdapter && m_swapchainWidth > 0 && m_swapchainHeight > 0) {
-                                    // Compute left-eye intrinsics (using left eye FOV for left-eye vectors)
-                                    auto intrinsics = utils::general::computeIntrinsics(
-                                        m_fovLeft, m_swapchainWidth, m_swapchainHeight);
-                                    
-                                    m_stereoAdapter = std::make_unique<StereoVectorAdapter>(
-                                        m_swapchainWidth,
-                                        m_swapchainHeight,
-                                        intrinsics.f_x,
-                                        intrinsics.f_y,
-                                        IPD,
-                                        NEAR_PLANE,
-                                        FAR_PLANE
-                                    );
-                                    
-                                    Log(fmt::format("StereoVectorAdapter initialized: {}x{}, f_x={:.1f}, f_y={:.1f}, IPD={:.3f}m\n",
-                                        m_swapchainWidth, m_swapchainHeight,
-                                        intrinsics.f_x, intrinsics.f_y, IPD));
-                                }
+                                // StereoVectorAdapter wiring is compiled in tests first.
+                                // Runtime integration into the layer remains pending.
                             }
                             break; // Only process first projection layer
                         }
@@ -463,9 +445,6 @@ namespace openxr_api_layer {
         // Swapchain resolution (for stereo adapter initialization)
         uint32_t m_swapchainWidth{0};
         uint32_t m_swapchainHeight{0};
-
-        // Stereo vector adapter (initialized when FOV and swapchain data are available)
-        std::unique_ptr<StereoVectorAdapter> m_stereoAdapter;
 
         // Placeholder: near/far planes for depth linearization (TODO: extract from projection matrix)
         // These are typical VR values; should be extracted from actual projection in future

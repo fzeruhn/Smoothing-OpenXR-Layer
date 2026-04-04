@@ -26,12 +26,15 @@
 #include <device_launch_parameters.h>
 #include <stdexcept>
 #include <cmath>
+#include <cstdio>
 
 #define CHECK_CUDA(call) \
     do { \
         cudaError_t err = (call); \
         if (err != cudaSuccess) { \
-            throw std::runtime_error(std::string("CUDA error at ") + __FILE__ + ":" + std::to_string(__LINE__) + ": " + cudaGetErrorString(err)); \
+            char _cudaError[512]; \
+            std::snprintf(_cudaError, sizeof(_cudaError), "CUDA error at %s:%d: %s", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            throw std::runtime_error(_cudaError); \
         } \
     } while (0)
 
