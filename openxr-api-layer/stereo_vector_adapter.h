@@ -36,10 +36,10 @@ class StereoVectorAdapter {
 public:
     // Constructor: allocates GPU buffers for the right-eye vector field, depth buffer, and hole map.
     // @param width, height: resolution of the left-eye input (right-eye assumed same resolution)
-    // @param f_x, f_y: camera intrinsics (focal lengths in pixels) from asymmetric FOV
+    // @param f_x: horizontal focal length in pixels from asymmetric FOV
     // @param ipd: interpupillary distance in meters (distance between eyes)
     // @param nearPlane, farPlane: depth range for linearization (from projection matrix)
-    StereoVectorAdapter(uint32_t width, uint32_t height, float f_x, float f_y, float ipd, float nearPlane, float farPlane);
+    StereoVectorAdapter(uint32_t width, uint32_t height, float f_x, float ipd, float nearPlane, float farPlane);
     ~StereoVectorAdapter();
 
     StereoVectorAdapter(const StereoVectorAdapter&) = delete;
@@ -49,6 +49,7 @@ public:
     // @param leftVectors: GPU buffer of left-eye motion vectors (float2, width×height)
     // @param leftDepth: GPU buffer of left-eye depth values (float, width×height, reversed-Z NDC [0,1])
     // @param rightDepth: GPU buffer of right-eye depth values (float, width×height, reversed-Z NDC [0,1])
+    //                    reserved for future depth-consistency/occlusion logic; currently unused.
     // @return: tuple of (rightVectors, holeMap)
     //   - rightVectors: GPU buffer of adapted right-eye motion vectors (float2, width×height)
     //   - holeMap: GPU buffer marking disocclusion regions (uint8_t, width×height, 0=valid, 1=hole)
@@ -67,7 +68,6 @@ private:
     uint32_t m_width;
     uint32_t m_height;
     float m_f_x;
-    float m_f_y;
     float m_ipd;
     float m_nearPlane;
     float m_farPlane;

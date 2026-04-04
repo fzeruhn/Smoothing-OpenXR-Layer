@@ -177,7 +177,6 @@ StereoVectorAdapter::StereoVectorAdapter(
     uint32_t width,
     uint32_t height,
     float f_x,
-    float f_y,
     float ipd,
     float nearPlane,
     float farPlane
@@ -185,7 +184,6 @@ StereoVectorAdapter::StereoVectorAdapter(
     : m_width(width)
     , m_height(height)
     , m_f_x(f_x)
-    , m_f_y(f_y)
     , m_ipd(ipd)
     , m_nearPlane(nearPlane)
     , m_farPlane(farPlane)
@@ -222,6 +220,8 @@ StereoVectorAdapter::AdaptResult StereoVectorAdapter::adapt(
     const float* leftDepth,
     const float* rightDepth
 ) {
+    (void)rightDepth;
+
     const size_t numPixels = m_width * m_height;
     
     // Clear output buffers

@@ -41,7 +41,6 @@ static constexpr uint32_t H = 256;
 // Camera intrinsics (simplified symmetric FOV for this test)
 // FOV = 90° horizontal → f_x ≈ W / (2 * tan(45°)) ≈ W / 2
 static constexpr float F_X = 128.0f;
-static constexpr float F_Y = 128.0f;
 
 // IPD (interpupillary distance) in meters
 static constexpr float IPD = 0.063f; // 63mm typical
@@ -146,7 +145,7 @@ int main()
     // -----------------------------------------------------------------------
 
     try {
-        openxr_api_layer::StereoVectorAdapter adapter(W, H, F_X, F_Y, IPD, NEAR_PLANE, FAR_PLANE);
+        openxr_api_layer::StereoVectorAdapter adapter(W, H, F_X, IPD, NEAR_PLANE, FAR_PLANE);
 
         auto result = adapter.adapt(d_leftVectors, d_leftDepth, d_rightDepth);
 
