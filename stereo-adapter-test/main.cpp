@@ -52,8 +52,8 @@ static constexpr float FAR_PLANE = 100.0f;
 
 // Depth layers (reversed-Z NDC, 1.0=near, 0.0=far)
 // Linearization formula: depth_linear = (near * far) / (far - depth_ndc * (far - near))
-// Foreground: 0.5m → reversed-Z ≈ 0.9
-// Background: 5.0m → reversed-Z ≈ 0.1
+// Foreground: reversed-Z = 0.1 → linear depth ≈ 0.11m (close)
+// Background: reversed-Z = 0.9 → linear depth ≈ 0.99m (farther)
 static constexpr float DEPTH_FOREGROUND = 0.1f; // Close (0.1m)
 static constexpr float DEPTH_BACKGROUND = 0.9f; // Far (1.0m)
 
