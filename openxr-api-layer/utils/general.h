@@ -69,4 +69,15 @@ namespace openxr_api_layer::utils::general {
         return {static_cast<LONG>(uv.x * quadPixelSize.width), static_cast<LONG>(uv.y * quadPixelSize.height)};
     }
 
+    struct CameraIntrinsics {
+        float f_x; // Horizontal focal length in pixels
+        float f_y; // Vertical focal length in pixels
+    };
+
+    // Compute camera intrinsics from asymmetric FOV and resolution.
+    // Handles asymmetric/canted displays (e.g., Pimax headsets) where FOV is not symmetric around optical axis.
+    // Formula: f_x = w / (tan(angleRight) - tan(angleLeft))
+    //          f_y = h / (tan(angleUp) - tan(angleDown))
+    CameraIntrinsics computeIntrinsics(const XrFovf& fov, uint32_t width, uint32_t height);
+
 } // namespace openxr_api_layer::utils::general

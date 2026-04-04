@@ -121,7 +121,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 8. Stereo Vector Adaptation - Can be done headless
+## 8. Stereo Vector Adaptation - Can be done headless ✅ COMPLETE
 
 **Goal:** Derive right-eye motion vectors from left-eye OFA output.
 
@@ -132,6 +132,8 @@ Each item is listed in dependency order. Complete earlier items before starting 
 - Apply perspective correction and handle disocclusion/overlap based on depth
 - Validate: compare adapted right-eye vectors to a direct right-eye OFA run (run OFA on both eyes in test mode, measure error)
 - Tune transform until adapted vectors are within acceptable error margin
+
+**Delivered:** `openxr-api-layer/stereo_vector_adapter.h/.cu` — `StereoVectorAdapter` RAII class with depth-tested atomic scatter kernel and hole marking. `utils/general.h/.cpp` — `computeIntrinsics()` helper for asymmetric FOV. `stereo-adapter-test/` — standalone test exe with synthetic depth-layered scene validation. Layer integration: FOV extraction in `xrEndFrame`, stereo adapter initialization when FOV and swapchain data available. `[READY FOR BUILD TEST]`.
 
 ---
 

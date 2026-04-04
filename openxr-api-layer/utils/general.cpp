@@ -142,4 +142,16 @@ namespace openxr_api_layer::utils::general {
         };
     }
 
+    CameraIntrinsics computeIntrinsics(const XrFovf& fov, uint32_t width, uint32_t height) {
+        const float tanLeft = std::tan(fov.angleLeft);
+        const float tanRight = std::tan(fov.angleRight);
+        const float tanUp = std::tan(fov.angleUp);
+        const float tanDown = std::tan(fov.angleDown);
+
+        const float f_x = static_cast<float>(width) / (tanRight - tanLeft);
+        const float f_y = static_cast<float>(height) / (tanUp - tanDown);
+
+        return {f_x, f_y};
+    }
+
 } // namespace openxr_api_layer::utils::general
