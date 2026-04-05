@@ -28,9 +28,6 @@
 #include <vector>
 #include <stdexcept>
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
-
 // ---------------------------------------------------------------------------
 // Test parameters
 // ---------------------------------------------------------------------------
@@ -275,35 +272,6 @@ int main()
         } else {
             printf("[PASS] Representative pixels map to expected right-eye positions\n");
         }
-
-        // -----------------------------------------------------------------------
-        // Generate PNG output (color-coded vector field)
-        // -----------------------------------------------------------------------
-
-        std::vector<uint8_t> rgb(W * H * 3);
-        for (uint32_t y = 0; y < H; ++y) {
-            for (uint32_t x = 0; x < W; ++x) {
-                uint32_t idx = y * W + x;
-                float2 v = h_rightVectors[idx];
-
-                // Color code: Red=X, Green=Y, scale to ±16px range
-                // Map [-512, +512] (±16px in S10.5) to [0, 255]
-                int r = (int)((v.x + 512.0f) * 255.0f / 1024.0f);
-                int g = (int)((v.y + 512.0f) * 255.0f / 1024.0f);
-                r = std::max(0, std::min(255, r));
-                g = std::max(0, std::min(255, g));
-
-                // Blue channel: hole map (white=hole, black=valid)
-                int b = h_holeMap[idx] ? 255 : 0;
-
-                rgb[idx * 3 + 0] = (uint8_t)r;
-                rgb[idx * 3 + 1] = (uint8_t)g;
-                rgb[idx * 3 + 2] = (uint8_t)b;
-            }
-        }
-
-        stbi_write_png("stereo-adapter-test-output.png", W, H, 3, rgb.data(), W * 3);
-        printf("\nWrote stereo-adapter-test-output.png (R=X_motion, G=Y_motion, B=holes)\n");
 
         // -----------------------------------------------------------------------
         // Final result
