@@ -28,6 +28,7 @@
 #include "depth_provider.h"
 #include "frame_broker.h"
 #include "frame_context.h"
+#include "frame_injection.h"
 #include "pose_provider.h"
 #include <log.h>
 #include <util.h>
@@ -70,6 +71,8 @@ namespace openxr_api_layer {
 
     class VulkanFrameProcessor {
       public:
+        static constexpr uint32_t kCommandBufferRingSize = 3;
+
         VulkanFrameProcessor(VkPhysicalDevice physicalDevice, VkDevice device, VkQueue queue, uint32_t queueFamilyIndex)
             : m_physicalDevice(physicalDevice), m_device(device), m_queue(queue) {
             // Create Command Pool for compute/graphics operations
@@ -84,8 +87,17 @@ namespace openxr_api_layer {
             allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
             allocInfo.commandPool = m_commandPool;
             allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocInfo.commandBufferCount = 1;
-            CHECK_VK_LAYER(vkAllocateCommandBuffers(m_device, &allocInfo, &m_commandBuffer));
+            allocInfo.commandBufferCount = kCommandBufferRingSize;
+            m_commandBuffers.resize(kCommandBufferRingSize);
+            CHECK_VK_LAYER(vkAllocateCommandBuffers(m_device, &allocInfo, m_commandBuffers.data()));
+
+            VkFenceCreateInfo fenceInfo{};
+            fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            m_submitFences.resize(kCommandBufferRingSize);
+            for (uint32_t i = 0; i < kCommandBufferRingSize; ++i) {
+                CHECK_VK_LAYER(vkCreateFence(m_device, &fenceInfo, nullptr, &m_submitFences[i]));
+            }
 
             // TODO: Initialize your Vulkan Compute Pipeline here
             // (Create Descriptor Sets, Pipeline Layout, Compute Pipeline for Motion Vectors + Warp)
@@ -93,26 +105,47 @@ namespace openxr_api_layer {
 
         ~VulkanFrameProcessor() {
             if (m_device) {
+                for (VkFence fence : m_submitFences) {
+                    if (fence != VK_NULL_HANDLE) {
+                        vkDestroyFence(m_device, fence, nullptr);
+                    }
+                }
                 vkDestroyCommandPool(m_device, m_commandPool, nullptr);
                 // TODO: Destroy your compute pipelines here
             }
         }
 
         // ASYNCHRONOUS processing. No vkQueueWaitIdle!
-        void ProcessFrames(VkImage colorCurrent, VkImage depthCurrent, VkImage colorPrevious, VkImage depthPrevious) {
+        bool ProcessFrames(VkImage colorCurrent, VkImage depthCurrent, VkImage colorPrevious, VkImage depthPrevious) {
+            (void)colorCurrent;
+            (void)depthCurrent;
             if (!colorPrevious || !depthPrevious)
-                return; // Need two frames to do motion vectors
+                return false; // Need two frames to do motion vectors
+
+            const uint32_t slot = m_submitIndex % kCommandBufferRingSize;
+            const VkResult fenceStatus = vkGetFenceStatus(m_device, m_submitFences[slot]);
+            if (fenceStatus == VK_NOT_READY) {
+                return false;
+            }
+            if (fenceStatus != VK_SUCCESS) {
+                throw std::runtime_error("Vulkan error checking submit fence status");
+            }
+
+            CHECK_VK_LAYER(vkResetFences(m_device, 1, &m_submitFences[slot]));
+
+            const VkCommandBuffer cmd = m_commandBuffers[slot];
+            CHECK_VK_LAYER(vkResetCommandBuffer(cmd, 0));
 
             VkCommandBufferBeginInfo beginInfo{};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            CHECK_VK_LAYER(vkBeginCommandBuffer(m_commandBuffer, &beginInfo));
+            CHECK_VK_LAYER(vkBeginCommandBuffer(cmd, &beginInfo));
 
             // 1. Image Memory Barriers (Transition layouts to be readable by your compute shader)
             // ... (Insert vkCmdPipelineBarrier here to transition to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
 
             // 2. Bind your Compute Pipeline
-            // vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
+            // vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
 
             // 3. Bind Descriptor Sets (Passing in Current & Previous Color/Depth)
             // vkCmdBindDescriptorSets(...)
@@ -120,26 +153,24 @@ namespace openxr_api_layer {
             // 4. Dispatch the compute shader
             // uint32_t groupCountX = (width + 15) / 16;
             // uint32_t groupCountY = (height + 15) / 16;
-            // vkCmdDispatch(m_commandBuffer, groupCountX, groupCountY, 1);
+            // vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
             // 5. Image Memory Barriers (Transition back to COLOR_ATTACHMENT_OPTIMAL for OpenXR)
             // ...
 
-            CHECK_VK_LAYER(vkEndCommandBuffer(m_commandBuffer));
+            CHECK_VK_LAYER(vkEndCommandBuffer(cmd));
 
             // Submit work to the GPU queue. We do NOT wait for it to finish here.
             // OpenXR / the VR runtime will handle synchronization via Vulkan semaphores/fences natively.
             //
-            // TODO (Item 10 — Frame Submission): This stub reuses a single command buffer with no
-            // fence.  Once ProcessFrames() records real GPU work, submitting without a fence while
-            // the previous submit may still be in flight is a Vulkan validation error.  Replace with
-            // either: (a) per-frame fences + CPU wait before re-recording, or (b) a ring of N
-            // command buffers (N >= 2 for double-buffering) so the CPU never races the GPU.
             VkSubmitInfo submitInfo{};
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &m_commandBuffer;
-            CHECK_VK_LAYER(vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE));
+            submitInfo.pCommandBuffers = &cmd;
+            CHECK_VK_LAYER(vkQueueSubmit(m_queue, 1, &submitInfo, m_submitFences[slot]));
+            ++m_submitIndex;
+
+            return true;
         }
 
       private:
@@ -147,7 +178,9 @@ namespace openxr_api_layer {
         VkDevice m_device;
         VkQueue m_queue;
         VkCommandPool m_commandPool;
-        VkCommandBuffer m_commandBuffer;
+        std::vector<VkCommandBuffer> m_commandBuffers;
+        std::vector<VkFence> m_submitFences;
+        uint32_t m_submitIndex{0};
         // TODO: Add VkPipeline, VkPipelineLayout, VkDescriptorSet etc.
     };
 
@@ -296,12 +329,18 @@ namespace openxr_api_layer {
                                    XrSwapchain* swapchain) override {
             XrResult result = OpenXrApi::xrCreateSwapchain(session, createInfo, swapchain);
 
+            if (FrameInjection::IsCreatingSwapchain()) {
+                return result;
+            }
+
             if (XR_SUCCEEDED(result) && session == m_session && m_apiType == GraphicsAPI::Vulkan) {
                 // Get color
                 if (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) {
                     const uint32_t previousWidth = m_frameBroker.GetSwapchainWidth();
                     const uint32_t previousHeight = m_frameBroker.GetSwapchainHeight();
-                    m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
+                    if (*swapchain != m_frameInjection.Swapchain()) {
+                        m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
+                    }
                     Log(fmt::format("Intercepted Color Swapchain Creation! Width: {} Height: {}\n", createInfo->width, createInfo->height));
 
                     // Store swapchain resolution for future stereo-adapter wiring.
@@ -413,6 +452,7 @@ namespace openxr_api_layer {
                 }
 
                 if (projectionLayer) {
+                    m_frameInjection.EnsureSwapchain(*this, session, m_frameBroker);
                     m_depthProvider.SetSwapchainImageLookup(m_frameBroker.GetVulkanImages(), m_frameBroker.GetAcquiredIndices());
                     const XrResult poseResult =
                         m_poseProvider.PopulatePredictedViews(*this, session, *projectionLayer, m_frameContext);
@@ -467,9 +507,11 @@ namespace openxr_api_layer {
                     // This removes camera rotation from the motion field, improving OFA quality.
 
                     // Dispatch to GPU. Do NOT wait for idle.
-                    m_processor->ProcessFrames(currentColor, currentDepth, m_prevColor, m_prevDepth);
-                    m_synthesizedColor = currentColor;
-                    m_hasSynthesisOutput = true;
+                    const bool submitted = m_processor->ProcessFrames(currentColor, currentDepth, m_prevColor, m_prevDepth);
+                    if (submitted) {
+                        m_synthesizedColor = currentColor;
+                        m_hasSynthesisOutput = true;
+                    }
                 }
 
                 // TODO: When OFA pipeline is integrated, invoke stereo vector adaptation here.
@@ -490,7 +532,10 @@ namespace openxr_api_layer {
             // Item 10 wiring stage: keep runtime submission unchanged for now while reporting
             // synthesis readiness. Actual layer replacement/injection is next step.
             if (m_hasSynthesisOutput && m_synthesizedColor != VK_NULL_HANDLE) {
-                TraceLoggingWrite(g_traceProvider, "Frame_Injection_Ready", TLArg(true, "Ready"));
+                TraceLoggingWrite(g_traceProvider,
+                                  "Frame_Injection_Ready",
+                                  TLArg(m_frameInjection.IsReady(), "InjectionSwapchainReady"),
+                                  TLArg(true, "SynthesisReady"));
             }
 
             // Finally, pass it back to the OpenXR runtime so it gets to the headset
@@ -508,6 +553,7 @@ namespace openxr_api_layer {
 
         std::unique_ptr<VulkanFrameProcessor> m_processor;
         FrameBroker m_frameBroker;
+        FrameInjection m_frameInjection;
         PoseProvider m_poseProvider;
         DepthProvider m_depthProvider;
         FrameContext m_frameContext{};

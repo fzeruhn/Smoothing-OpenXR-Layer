@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <optional>
 #include <openxr/openxr.h>
 #include <vector>
 #include <vulkan/vulkan.h>
@@ -17,6 +18,8 @@ class FrameBroker {
 
     VkImage GetCurrentColorImage() const;
     VkImage GetCurrentDepthImage() const;
+    XrSwapchain GetPrimaryColorSwapchain() const;
+    std::optional<XrSwapchainCreateInfo> GetPrimaryColorCreateInfo() const;
 
     bool IsColorSwapchain(XrSwapchain swapchain) const;
     bool IsDepthSwapchain(XrSwapchain swapchain) const;
@@ -34,6 +37,7 @@ class FrameBroker {
     std::vector<XrSwapchain> m_depthSwapchains;
     std::map<XrSwapchain, std::vector<VkImage>> m_vulkanImages;
     std::map<XrSwapchain, uint32_t> m_acquiredIndices;
+    std::optional<XrSwapchainCreateInfo> m_primaryColorCreateInfo;
     uint32_t m_swapchainWidth{0};
     uint32_t m_swapchainHeight{0};
 };

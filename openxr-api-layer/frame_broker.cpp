@@ -8,6 +8,9 @@ namespace openxr_api_layer {
 void FrameBroker::RegisterSwapchain(XrSwapchain swapchain, const XrSwapchainCreateInfo& createInfo) {
     if ((createInfo.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0) {
         m_colorSwapchains.push_back(swapchain);
+        if (!m_primaryColorCreateInfo.has_value()) {
+            m_primaryColorCreateInfo = createInfo;
+        }
         m_swapchainWidth = createInfo.width;
         m_swapchainHeight = createInfo.height;
     } else if ((createInfo.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
@@ -68,6 +71,17 @@ VkImage FrameBroker::GetCurrentDepthImage() const {
         return VK_NULL_HANDLE;
     }
     return GetCurrentImageForSwapchain(m_depthSwapchains.front());
+}
+
+XrSwapchain FrameBroker::GetPrimaryColorSwapchain() const {
+    if (m_colorSwapchains.empty()) {
+        return XR_NULL_HANDLE;
+    }
+    return m_colorSwapchains.front();
+}
+
+std::optional<XrSwapchainCreateInfo> FrameBroker::GetPrimaryColorCreateInfo() const {
+    return m_primaryColorCreateInfo;
 }
 
 bool FrameBroker::IsColorSwapchain(XrSwapchain swapchain) const {
