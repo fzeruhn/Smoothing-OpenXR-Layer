@@ -67,45 +67,56 @@ OFAPipeline::OFAPipeline(CUcontext ctx,
     // 1. Dynamically load NvOF function pointer table from the driver DLL.
     // NV_OF_CUDA_API_FUNCTION_LIST has no .size field — zero-init is correct.
     auto NvOFAPICreateInstanceCuda = loadEntryPoint(&m_hModule);
-    CHECK_NVOF_INIT(NvOFAPICreateInstanceCuda(NV_OF_API_VERSION, &m_api));
 
-    // 2. Create OFA instance bound to CUDA context.
-    CHECK_NVOF(m_api.nvCreateOpticalFlowCuda(ctx, &m_hOf));
+    // Guard: if anything below throws, the destructor won't run (constructor
+    // didn't complete), so we must free the module handle ourselves.
+    try {
+        CHECK_NVOF_INIT(NvOFAPICreateInstanceCuda(NV_OF_API_VERSION, &m_api));
 
-    // 3. Configure and initialise OFA.
-    NV_OF_INIT_PARAMS params{};
-    params.width               = width;
-    params.height              = height;
-    params.outGridSize         = gridSize;
-    params.hintGridSize        = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
-    params.mode                = NV_OF_MODE_OPTICALFLOW;
-    params.perfLevel           = perfLevel;
-    params.enableExternalHints = NV_OF_FALSE;
-    params.enableOutputCost    = NV_OF_FALSE;
-    params.enableRoi           = NV_OF_FALSE;
-    params.predDirection       = NV_OF_PRED_DIRECTION_FORWARD;
-    params.enableGlobalFlow    = NV_OF_FALSE;
-    params.inputBufferFormat   = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
-    CHECK_NVOF(m_api.nvOFInit(m_hOf, &params));
+        // 2. Create OFA instance bound to CUDA context.
+        CHECK_NVOF(m_api.nvCreateOpticalFlowCuda(ctx, &m_hOf));
 
-    // 4. Create two input buffers (slot 0 = current, slot 1 = reference).
-    NV_OF_BUFFER_DESCRIPTOR inputDesc{};
-    inputDesc.width        = width;
-    inputDesc.height       = height;
-    inputDesc.bufferUsage  = NV_OF_BUFFER_USAGE_INPUT;
-    inputDesc.bufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
-    for (int i = 0; i < 2; ++i)
-        CHECK_NVOF(m_api.nvOFCreateGPUBufferCuda(m_hOf, &inputDesc,
-                   NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &m_inputBufs[i]));
+        // 3. Configure and initialise OFA.
+        NV_OF_INIT_PARAMS params{};
+        params.width               = width;
+        params.height              = height;
+        params.outGridSize         = gridSize;
+        params.hintGridSize        = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
+        params.mode                = NV_OF_MODE_OPTICALFLOW;
+        params.perfLevel           = perfLevel;
+        params.enableExternalHints = NV_OF_FALSE;
+        params.enableOutputCost    = NV_OF_FALSE;
+        params.enableRoi           = NV_OF_FALSE;
+        params.predDirection       = NV_OF_PRED_DIRECTION_FORWARD;
+        params.enableGlobalFlow    = NV_OF_FALSE;
+        params.inputBufferFormat   = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
+        CHECK_NVOF(m_api.nvOFInit(m_hOf, &params));
 
-    // 5. Create output buffer (NV_OF_FLOW_VECTOR = SHORT2, one entry per grid cell).
-    NV_OF_BUFFER_DESCRIPTOR outputDesc{};
-    outputDesc.width        = m_outW;
-    outputDesc.height       = m_outH;
-    outputDesc.bufferUsage  = NV_OF_BUFFER_USAGE_OUTPUT;
-    outputDesc.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
-    CHECK_NVOF(m_api.nvOFCreateGPUBufferCuda(m_hOf, &outputDesc,
-               NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &m_outputBuf));
+        // 4. Create two input buffers (slot 0 = current, slot 1 = reference).
+        NV_OF_BUFFER_DESCRIPTOR inputDesc{};
+        inputDesc.width        = width;
+        inputDesc.height       = height;
+        inputDesc.bufferUsage  = NV_OF_BUFFER_USAGE_INPUT;
+        inputDesc.bufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
+        for (int i = 0; i < 2; ++i)
+            CHECK_NVOF(m_api.nvOFCreateGPUBufferCuda(m_hOf, &inputDesc,
+                       NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &m_inputBufs[i]));
+
+        // 5. Create output buffer (NV_OF_FLOW_VECTOR = SHORT2, one entry per grid cell).
+        NV_OF_BUFFER_DESCRIPTOR outputDesc{};
+        outputDesc.width        = m_outW;
+        outputDesc.height       = m_outH;
+        outputDesc.bufferUsage  = NV_OF_BUFFER_USAGE_OUTPUT;
+        outputDesc.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
+        CHECK_NVOF(m_api.nvOFCreateGPUBufferCuda(m_hOf, &outputDesc,
+                   NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &m_outputBuf));
+    } catch (...) {
+#ifdef _WIN32
+        FreeLibrary(static_cast<HMODULE>(m_hModule));
+#endif
+        m_hModule = nullptr;
+        throw;
+    }
 }
 
 // -------------------------------------------------------------------------

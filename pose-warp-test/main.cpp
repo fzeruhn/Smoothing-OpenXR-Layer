@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <iterator>
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -76,7 +77,7 @@ static VkDevice createVulkanDevice(VkInstance& instance, VkPhysicalDevice& physD
     appInfo.apiVersion = VK_API_VERSION_1_2;
 
     // Instance-level capability-query extensions required as prerequisites for
-    // VK_KHR_external_memory_win32 on the device.  Matches interop-test setup.
+    // VK_KHR_external_memory_win32 on the device (same set as interop-test).
     const char* instExts[] = {
         VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
         VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
@@ -86,7 +87,7 @@ static VkDevice createVulkanDevice(VkInstance& instance, VkPhysicalDevice& physD
     VkInstanceCreateInfo instanceInfo{};
     instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instanceInfo.pApplicationInfo = &appInfo;
-    instanceInfo.enabledExtensionCount   = 3;
+    instanceInfo.enabledExtensionCount   = static_cast<uint32_t>(std::size(instExts));
     instanceInfo.ppEnabledExtensionNames = instExts;
 
     if (vkCreateInstance(&instanceInfo, nullptr, &instance) != VK_SUCCESS) {

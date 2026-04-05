@@ -102,7 +102,7 @@ namespace openxr_api_layer {
             VkCommandBufferBeginInfo beginInfo{};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
+            CHECK_VK_LAYER(vkBeginCommandBuffer(m_commandBuffer, &beginInfo));
 
             // 1. Image Memory Barriers (Transition layouts to be readable by your compute shader)
             // ... (Insert vkCmdPipelineBarrier here to transition to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
@@ -121,7 +121,7 @@ namespace openxr_api_layer {
             // 5. Image Memory Barriers (Transition back to COLOR_ATTACHMENT_OPTIMAL for OpenXR)
             // ...
 
-            vkEndCommandBuffer(m_commandBuffer);
+            CHECK_VK_LAYER(vkEndCommandBuffer(m_commandBuffer));
 
             // Submit work to the GPU queue. We do NOT wait for it to finish here.
             // OpenXR / the VR runtime will handle synchronization via Vulkan semaphores/fences natively.
@@ -135,7 +135,7 @@ namespace openxr_api_layer {
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &m_commandBuffer;
-            vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+            CHECK_VK_LAYER(vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE));
         }
 
       private:
