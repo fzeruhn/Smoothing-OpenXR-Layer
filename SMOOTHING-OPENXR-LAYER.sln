@@ -15,6 +15,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "hole-fill-test", "hole-fill
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "stereo-adapter-test", "stereo-adapter-test\stereo-adapter-test.vcxproj", "{A1B2C3D4-E5F6-7A8B-9C0D-E1F2A3B4C5D6}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "pose-warp-test", "pose-warp-test\pose-warp-test.vcxproj", "{2B3C4D5E-6F7A-8B9C-0D1E-2F3A4B5C6D7E}"
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Files", "Solution Files", "{A53ED6CB-95D3-4833-8A16-C6A588F16F6E}"
 	ProjectSection(SolutionItems) = preProject
 		.clang-format = .clang-format
@@ -81,6 +83,12 @@ Global
 		{A1B2C3D4-E5F6-7A8B-9C0D-E1F2A3B4C5D6}.Release|Win32.ActiveCfg = Release|x64
 		{A1B2C3D4-E5F6-7A8B-9C0D-E1F2A3B4C5D6}.Release|x64.ActiveCfg = Release|x64
 		{A1B2C3D4-E5F6-7A8B-9C0D-E1F2A3B4C5D6}.Release|x64.Build.0 = Release|x64
+		{2B3C4D5E-6F7A-8B9C-0D1E-2F3A4B5C6D7E}.Debug|Win32.ActiveCfg = Debug|x64
+		{2B3C4D5E-6F7A-8B9C-0D1E-2F3A4B5C6D7E}.Debug|x64.ActiveCfg = Debug|x64
+		{2B3C4D5E-6F7A-8B9C-0D1E-2F3A4B5C6D7E}.Debug|x64.Build.0 = Debug|x64
+		{2B3C4D5E-6F7A-8B9C-0D1E-2F3A4B5C6D7E}.Release|Win32.ActiveCfg = Release|x64
+		{2B3C4D5E-6F7A-8B9C-0D1E-2F3A4B5C6D7E}.Release|x64.ActiveCfg = Release|x64
+		{2B3C4D5E-6F7A-8B9C-0D1E-2F3A4B5C6D7E}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
