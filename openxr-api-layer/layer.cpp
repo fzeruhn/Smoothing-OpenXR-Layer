@@ -25,6 +25,11 @@
 
 #include "pch.h"
 #include "layer.h"
+#include "depth_provider.h"
+#include "frame_broker.h"
+#include "frame_context.h"
+#include "frame_injection.h"
+#include "pose_provider.h"
 #include <log.h>
 #include <util.h>
 #include <algorithm>
@@ -36,6 +41,7 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr_platform.h>
 #include <map>       // For tracking image indices
+#include <vector>
 
 // TODO (Item 4): Uncomment when pose warp is fully integrated
 // #include "pose_warp.h"
@@ -47,14 +53,14 @@ namespace openxr_api_layer {
     using namespace log;
 
     // Vulkan result check for internal layer use (not to be confused with CHECK_XRCMD).
-    // Throws on failure so that constructor exceptions are visible and the layer doesn't
-    // silently proceed with a null command pool / buffer.
+    // Returns from the enclosing bool function on failure.
 #define CHECK_VK_LAYER(call) \
     do { \
         VkResult _vr = (call); \
-        if (_vr != VK_SUCCESS) \
-            throw std::runtime_error("Vulkan error " + std::to_string(static_cast<int>(_vr)) \
-                                     + " in " #call); \
+        if (_vr != VK_SUCCESS) { \
+            Log(fmt::format("[ERROR] Vulkan call failed: {} (VkResult={})\n", #call, static_cast<int>(_vr))); \
+            return false; \
+        } \
     } while (0)
 
     // Our API layer implement these extensions, and their specified version.
@@ -66,8 +72,37 @@ namespace openxr_api_layer {
 
     class VulkanFrameProcessor {
       public:
+        static constexpr uint32_t kCommandBufferRingSize = 3;
+
         VulkanFrameProcessor(VkPhysicalDevice physicalDevice, VkDevice device, VkQueue queue, uint32_t queueFamilyIndex)
             : m_physicalDevice(physicalDevice), m_device(device), m_queue(queue) {
+            m_valid = Initialize(queueFamilyIndex);
+        }
+
+        bool IsValid() const {
+            return m_valid;
+        }
+
+        bool WaitForCopyCompletion() const {
+            if (!m_valid) {
+                Log("[ERROR] WaitForCopyCompletion called on invalid VulkanFrameProcessor.\n");
+                return false;
+            }
+            if (m_submitIndex == 0) {
+                return true;
+            }
+
+            const uint32_t lastSlot = (m_submitIndex - 1) % kCommandBufferRingSize;
+            const VkResult waitResult = vkWaitForFences(m_device, 1, &m_submitFences[lastSlot], VK_TRUE, UINT64_MAX);
+            if (waitResult != VK_SUCCESS) {
+                Log(fmt::format("[ERROR] Vulkan call failed: vkWaitForFences (VkResult={})\n", static_cast<int>(waitResult)));
+                return false;
+            }
+            return true;
+        }
+
+      private:
+        bool Initialize(uint32_t queueFamilyIndex) {
             // Create Command Pool for compute/graphics operations
             VkCommandPoolCreateInfo poolInfo{};
             poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -80,35 +115,186 @@ namespace openxr_api_layer {
             allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
             allocInfo.commandPool = m_commandPool;
             allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocInfo.commandBufferCount = 1;
-            CHECK_VK_LAYER(vkAllocateCommandBuffers(m_device, &allocInfo, &m_commandBuffer));
+            allocInfo.commandBufferCount = kCommandBufferRingSize;
+            m_commandBuffers.resize(kCommandBufferRingSize);
+            CHECK_VK_LAYER(vkAllocateCommandBuffers(m_device, &allocInfo, m_commandBuffers.data()));
+
+            VkFenceCreateInfo fenceInfo{};
+            fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            m_submitFences.resize(kCommandBufferRingSize);
+            for (uint32_t i = 0; i < kCommandBufferRingSize; ++i) {
+                CHECK_VK_LAYER(vkCreateFence(m_device, &fenceInfo, nullptr, &m_submitFences[i]));
+            }
 
             // TODO: Initialize your Vulkan Compute Pipeline here
             // (Create Descriptor Sets, Pipeline Layout, Compute Pipeline for Motion Vectors + Warp)
+            return true;
         }
 
+      public:
         ~VulkanFrameProcessor() {
             if (m_device) {
+                for (VkFence fence : m_submitFences) {
+                    if (fence != VK_NULL_HANDLE) {
+                        vkDestroyFence(m_device, fence, nullptr);
+                    }
+                }
                 vkDestroyCommandPool(m_device, m_commandPool, nullptr);
                 // TODO: Destroy your compute pipelines here
             }
         }
 
-        // ASYNCHRONOUS processing. No vkQueueWaitIdle!
-        void ProcessFrames(VkImage colorCurrent, VkImage depthCurrent, VkImage colorPrevious, VkImage depthPrevious) {
-            if (!colorPrevious || !depthPrevious)
-                return; // Need two frames to do motion vectors
+        bool CopyColorImage(VkImage sourceColor, VkImage targetColor, uint32_t width, uint32_t height) {
+            if (!sourceColor || !targetColor || width == 0 || height == 0) {
+                return false;
+            }
+
+            const uint32_t slot = m_submitIndex % kCommandBufferRingSize;
+            const VkResult fenceStatus = vkGetFenceStatus(m_device, m_submitFences[slot]);
+            if (fenceStatus == VK_NOT_READY) {
+                return false;
+            }
+            if (fenceStatus != VK_SUCCESS) {
+                Log(fmt::format("[ERROR] Vulkan call failed: vkGetFenceStatus (VkResult={})\n", static_cast<int>(fenceStatus)));
+                return false;
+            }
+
+            CHECK_VK_LAYER(vkResetFences(m_device, 1, &m_submitFences[slot]));
+
+            const VkCommandBuffer cmd = m_commandBuffers[slot];
+            CHECK_VK_LAYER(vkResetCommandBuffer(cmd, 0));
 
             VkCommandBufferBeginInfo beginInfo{};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            CHECK_VK_LAYER(vkBeginCommandBuffer(m_commandBuffer, &beginInfo));
+            CHECK_VK_LAYER(vkBeginCommandBuffer(cmd, &beginInfo));
+
+            VkImageMemoryBarrier toTransfer[2]{};
+            toTransfer[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            toTransfer[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            toTransfer[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toTransfer[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            toTransfer[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toTransfer[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toTransfer[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toTransfer[0].image = sourceColor;
+            toTransfer[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            toTransfer[0].subresourceRange.baseMipLevel = 0;
+            toTransfer[0].subresourceRange.levelCount = 1;
+            toTransfer[0].subresourceRange.baseArrayLayer = 0;
+            toTransfer[0].subresourceRange.layerCount = 1;
+
+            toTransfer[1] = toTransfer[0];
+            toTransfer[1].srcAccessMask = 0;
+            toTransfer[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            // The injection image has just been acquired for this frame and we overwrite it fully,
+            // so we can transition from UNDEFINED and discard any previous contents.
+            toTransfer[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            toTransfer[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toTransfer[1].image = targetColor;
+
+            // Source and target images have different producer stages:
+            // source may come from color attachment writes, while target starts from UNDEFINED.
+            vkCmdPipelineBarrier(cmd,
+                                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0,
+                                 0,
+                                 nullptr,
+                                 0,
+                                 nullptr,
+                                 2,
+                                 toTransfer);
+
+            VkImageCopy copyRegion{};
+            copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.srcSubresource.baseArrayLayer = 0;
+            copyRegion.srcSubresource.layerCount = 1;
+            copyRegion.srcSubresource.mipLevel = 0;
+            copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.dstSubresource.baseArrayLayer = 0;
+            copyRegion.dstSubresource.layerCount = 1;
+            copyRegion.dstSubresource.mipLevel = 0;
+            copyRegion.extent.width = width;
+            copyRegion.extent.height = height;
+            copyRegion.extent.depth = 1;
+            vkCmdCopyImage(cmd,
+                           sourceColor,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           targetColor,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1,
+                           &copyRegion);
+
+            VkImageMemoryBarrier toCompositor[2]{};
+            toCompositor[0] = toTransfer[0];
+            toCompositor[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toCompositor[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            toCompositor[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toCompositor[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+            toCompositor[1] = toTransfer[1];
+            toCompositor[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toCompositor[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            toCompositor[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toCompositor[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+            vkCmdPipelineBarrier(cmd,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 0,
+                                 0,
+                                 nullptr,
+                                 0,
+                                 nullptr,
+                                 2,
+                                 toCompositor);
+
+            CHECK_VK_LAYER(vkEndCommandBuffer(cmd));
+
+            VkSubmitInfo submitInfo{};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            CHECK_VK_LAYER(vkQueueSubmit(m_queue, 1, &submitInfo, m_submitFences[slot]));
+            ++m_submitIndex;
+
+            return true;
+        }
+
+        // ASYNCHRONOUS processing. No vkQueueWaitIdle!
+        bool ProcessFrames(VkImage colorCurrent, VkImage depthCurrent, VkImage colorPrevious, VkImage depthPrevious) {
+            (void)colorCurrent;
+            (void)depthCurrent;
+            if (!colorPrevious || !depthPrevious)
+                return false; // Need two frames to do motion vectors
+
+            const uint32_t slot = m_submitIndex % kCommandBufferRingSize;
+            const VkResult fenceStatus = vkGetFenceStatus(m_device, m_submitFences[slot]);
+            if (fenceStatus == VK_NOT_READY) {
+                return false;
+            }
+            if (fenceStatus != VK_SUCCESS) {
+                Log(fmt::format("[ERROR] Vulkan call failed: vkGetFenceStatus (VkResult={})\n", static_cast<int>(fenceStatus)));
+                return false;
+            }
+
+            CHECK_VK_LAYER(vkResetFences(m_device, 1, &m_submitFences[slot]));
+
+            const VkCommandBuffer cmd = m_commandBuffers[slot];
+            CHECK_VK_LAYER(vkResetCommandBuffer(cmd, 0));
+
+            VkCommandBufferBeginInfo beginInfo{};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            CHECK_VK_LAYER(vkBeginCommandBuffer(cmd, &beginInfo));
 
             // 1. Image Memory Barriers (Transition layouts to be readable by your compute shader)
             // ... (Insert vkCmdPipelineBarrier here to transition to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
 
             // 2. Bind your Compute Pipeline
-            // vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
+            // vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
 
             // 3. Bind Descriptor Sets (Passing in Current & Previous Color/Depth)
             // vkCmdBindDescriptorSets(...)
@@ -116,26 +302,24 @@ namespace openxr_api_layer {
             // 4. Dispatch the compute shader
             // uint32_t groupCountX = (width + 15) / 16;
             // uint32_t groupCountY = (height + 15) / 16;
-            // vkCmdDispatch(m_commandBuffer, groupCountX, groupCountY, 1);
+            // vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
             // 5. Image Memory Barriers (Transition back to COLOR_ATTACHMENT_OPTIMAL for OpenXR)
             // ...
 
-            CHECK_VK_LAYER(vkEndCommandBuffer(m_commandBuffer));
+            CHECK_VK_LAYER(vkEndCommandBuffer(cmd));
 
             // Submit work to the GPU queue. We do NOT wait for it to finish here.
             // OpenXR / the VR runtime will handle synchronization via Vulkan semaphores/fences natively.
             //
-            // TODO (Item 10 — Frame Submission): This stub reuses a single command buffer with no
-            // fence.  Once ProcessFrames() records real GPU work, submitting without a fence while
-            // the previous submit may still be in flight is a Vulkan validation error.  Replace with
-            // either: (a) per-frame fences + CPU wait before re-recording, or (b) a ring of N
-            // command buffers (N >= 2 for double-buffering) so the CPU never races the GPU.
             VkSubmitInfo submitInfo{};
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &m_commandBuffer;
-            CHECK_VK_LAYER(vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE));
+            submitInfo.pCommandBuffers = &cmd;
+            CHECK_VK_LAYER(vkQueueSubmit(m_queue, 1, &submitInfo, m_submitFences[slot]));
+            ++m_submitIndex;
+
+            return true;
         }
 
       private:
@@ -143,7 +327,10 @@ namespace openxr_api_layer {
         VkDevice m_device;
         VkQueue m_queue;
         VkCommandPool m_commandPool;
-        VkCommandBuffer m_commandBuffer;
+        std::vector<VkCommandBuffer> m_commandBuffers;
+        std::vector<VkFence> m_submitFences;
+        uint32_t m_submitIndex{0};
+        bool m_valid{false};
         // TODO: Add VkPipeline, VkPipelineLayout, VkDescriptorSet etc.
     };
 
@@ -270,6 +457,7 @@ namespace openxr_api_layer {
                     m_vkPhysicalDevice = vkBinding->physicalDevice;
                     m_vkDevice = vkBinding->device;
                     m_vkQueueFamilyIndex = vkBinding->queueFamilyIndex;
+                    m_vkQueueIndex = vkBinding->queueIndex;
                 } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
                     Log("Game is using DX11\n");
                     m_apiType = GraphicsAPI::DX11;
@@ -282,6 +470,16 @@ namespace openxr_api_layer {
             if (XR_SUCCEEDED(result) && isSystemHandled(createInfo->systemId)) {
                 m_session = *session;
                 Log(fmt::format("Captured VR Session: {}\n", (void*)m_session));
+
+                PFN_xrVoidFunction waitFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrWaitSwapchainImage", &waitFn))) {
+                    m_xrWaitSwapchainImage = reinterpret_cast<PFN_xrWaitSwapchainImage>(waitFn);
+                }
+
+                PFN_xrVoidFunction releaseFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrReleaseSwapchainImage", &releaseFn))) {
+                    m_xrReleaseSwapchainImage = reinterpret_cast<PFN_xrReleaseSwapchainImage>(releaseFn);
+                }
             }
             return result;
         }
@@ -292,37 +490,46 @@ namespace openxr_api_layer {
                                    XrSwapchain* swapchain) override {
             XrResult result = OpenXrApi::xrCreateSwapchain(session, createInfo, swapchain);
 
+            if (FrameInjection::IsCreatingSwapchain()) {
+                return result;
+            }
+
             if (XR_SUCCEEDED(result) && session == m_session && m_apiType == GraphicsAPI::Vulkan) {
                 // Get color
                 if (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) {
+                    const uint32_t previousWidth = m_frameBroker.GetSwapchainWidth();
+                    const uint32_t previousHeight = m_frameBroker.GetSwapchainHeight();
+                    if (*swapchain != m_frameInjection.Swapchain()) {
+                        m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
+                    }
                     Log(fmt::format("Intercepted Color Swapchain Creation! Width: {} Height: {}\n", createInfo->width, createInfo->height));
-                    // Save this swapchain handle so we know to track its images
-                    m_colorSwapchains.push_back(*swapchain);
 
                     // Store swapchain resolution for future stereo-adapter wiring.
-                    if (m_swapchainWidth != 0 && m_swapchainHeight != 0 &&
-                        (m_swapchainWidth != createInfo->width || m_swapchainHeight != createInfo->height)) {
+                    if (previousWidth != 0 && previousHeight != 0 &&
+                        (previousWidth != createInfo->width || previousHeight != createInfo->height)) {
                         Log(fmt::format("[WARN] Color swapchain resolution changed from {}x{} to {}x{}; "
                             "future stereo adaptation must use per-swapchain dimensions\n",
-                            m_swapchainWidth, m_swapchainHeight, createInfo->width, createInfo->height));
+                            previousWidth, previousHeight, createInfo->width, createInfo->height));
                     }
-
-                    m_swapchainWidth = createInfo->width;
-                    m_swapchainHeight = createInfo->height;
 
                     // Initialize the processor
                     if (!m_processor && m_vkDevice != VK_NULL_HANDLE) {
                         VkQueue queue;
-                        vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, 0, &queue);
-                        m_processor = std::make_unique<VulkanFrameProcessor>(
+                        vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &queue);
+                        auto processor = std::make_unique<VulkanFrameProcessor>(
                             m_vkPhysicalDevice, m_vkDevice, queue, m_vkQueueFamilyIndex);
-                        Log("Vulkan Frame Processor Initialized!\n");
+                        if (processor->IsValid()) {
+                            m_processor = std::move(processor);
+                            Log("Vulkan Frame Processor Initialized!\n");
+                        } else {
+                            Log("[ERROR] Failed to initialize Vulkan Frame Processor.\n");
+                        }
                     }
 
                 // Get depth
                 } else if (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+                    m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
                     Log(fmt::format("Intercepted Depth Swapchain! Width: {} Height: {}\n", createInfo->width, createInfo->height));
-                    m_depthSwapchains.push_back(*swapchain);
                 }
             }
             return result;
@@ -337,18 +544,16 @@ namespace openxr_api_layer {
                 OpenXrApi::xrEnumerateSwapchainImages(swapchain, imageCapacityInput, imageCountOutput, images);
 
             if (XR_SUCCEEDED(result) && images != nullptr && m_apiType == GraphicsAPI::Vulkan) {
-                // If this is a color or depth swapchain we care about...
-                bool isTracked =
-                    std::find(m_colorSwapchains.begin(), m_colorSwapchains.end(), swapchain) !=
-                        m_colorSwapchains.end() ||
-                    std::find(m_depthSwapchains.begin(), m_depthSwapchains.end(), swapchain) != m_depthSwapchains.end();
-
-                if (isTracked) {
-                    XrSwapchainImageVulkanKHR* vkImages = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
-                    for (uint32_t i = 0; i < *imageCountOutput; i++) {
-                        m_vulkanImages[swapchain].push_back(vkImages[i].image);
-                    }
+                if (m_frameBroker.IsColorSwapchain(swapchain) || m_frameBroker.IsDepthSwapchain(swapchain)) {
+                    m_frameBroker.RegisterSwapchainImages(swapchain, *imageCountOutput, images);
                     Log(fmt::format("Mapped {} Vulkan images for swapchain.\n", *imageCountOutput));
+                } else if (swapchain == m_frameInjection.Swapchain()) {
+                    const auto* vkImages = reinterpret_cast<const XrSwapchainImageVulkanKHR*>(images);
+                    m_injectionVulkanImages.clear();
+                    m_injectionVulkanImages.reserve(*imageCountOutput);
+                    for (uint32_t i = 0; i < *imageCountOutput; ++i) {
+                        m_injectionVulkanImages.push_back(vkImages[i].image);
+                    }
                 }
             }
             return result;
@@ -360,7 +565,15 @@ namespace openxr_api_layer {
                                          uint32_t* index) override {
             XrResult result = OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
             if (XR_SUCCEEDED(result)) {
-                m_acquiredIndices[swapchain] = *index; // Remember this index for EndFrame
+                m_frameBroker.OnAcquireSwapchainImage(swapchain, *index); // Remember this index for EndFrame
+            }
+            return result;
+        }
+
+        XrResult xrWaitFrame(XrSession session, const XrFrameWaitInfo* frameWaitInfo, XrFrameState* frameState) override {
+            XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            if (XR_SUCCEEDED(result) && session == m_session && frameState && frameState->type == XR_TYPE_FRAME_STATE) {
+                m_poseProvider.OnWaitFrame(*frameState);
             }
             return result;
         }
@@ -368,18 +581,26 @@ namespace openxr_api_layer {
         // 4. HOOK END FRAME (The trigger to copy the data)
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             if (session == m_session && m_apiType == GraphicsAPI::Vulkan) {
+                m_frameContext = FrameContext{};
+                const XrCompositionLayerProjection* projectionLayer = nullptr;
+
                 // Extract per-eye FOV from projection layers
                 if (frameEndInfo && frameEndInfo->layerCount > 0) {
                     for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
                         const XrCompositionLayerBaseHeader* layer = frameEndInfo->layers[i];
                         if (layer && layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-                            const XrCompositionLayerProjection* projLayer =
+                            projectionLayer =
                                 reinterpret_cast<const XrCompositionLayerProjection*>(layer);
                             
                             // Extract FOV from both eyes
-                            if (projLayer->viewCount >= 2) {
-                                m_fovLeft = projLayer->views[0].fov;
-                                m_fovRight = projLayer->views[1].fov;
+                            if (projectionLayer->viewCount >= 2) {
+                                m_fovLeft = projectionLayer->views[0].fov;
+                                m_fovRight = projectionLayer->views[1].fov;
+                                for (uint32_t eye = 0; eye < 2; ++eye) {
+                                    m_frameContext.renderViews[eye].fov = projectionLayer->views[eye].fov;
+                                    m_frameContext.renderViews[eye].pose = projectionLayer->views[eye].pose;
+                                    m_frameContext.renderViews[eye].valid = true;
+                                }
                                 
                                 if (!m_fovInitialized) {
                                     m_fovInitialized = true;
@@ -403,19 +624,46 @@ namespace openxr_api_layer {
                     }
                 }
 
-                VkImage currentColor = VK_NULL_HANDLE;
-                VkImage currentDepth = VK_NULL_HANDLE;
+                if (projectionLayer) {
+                    m_frameInjection.EnsureSwapchain(*this, session, m_frameBroker);
+                    m_depthProvider.SetSwapchainImageLookup(m_frameBroker.GetVulkanImages(), m_frameBroker.GetAcquiredIndices());
+                    const XrResult poseResult =
+                        m_poseProvider.PopulatePredictedViews(*this, session, *projectionLayer, m_frameContext);
+                    if (XR_FAILED(poseResult)) {
+                        TraceLoggingWrite(g_traceProvider,
+                                          "PoseProvider_Failed",
+                                          TLArg(xr::ToCString(poseResult), "Result"));
+                    }
 
-                // 1. Grab Current Color
-                if (!m_colorSwapchains.empty()) {
-                    XrSwapchain colorChain = m_colorSwapchains[0];
-                    currentColor = m_vulkanImages[colorChain][m_acquiredIndices[colorChain]];
+                    m_depthProvider.ExtractDepthInfo(*projectionLayer, m_frameContext);
+                    const bool hasDepthChain = m_frameContext.depthViews[0].valid || m_frameContext.depthViews[1].valid;
+                    if (!hasDepthChain && !m_depthWarningLogged) {
+                        m_depthWarningLogged = true;
+                        Log("[WARN] No XR_KHR_composition_layer_depth info on projection views; using tracked depth swapchains.\n");
+                    }
+
+                    if (hasDepthChain) {
+                        const auto& depthView = m_frameContext.depthViews[0].valid ? m_frameContext.depthViews[0] : m_frameContext.depthViews[1];
+                        TraceLoggingWrite(g_traceProvider,
+                                          "Depth_Metadata",
+                                          TLArg(depthView.minDepth, "MinDepth"),
+                                          TLArg(depthView.maxDepth, "MaxDepth"),
+                                          TLArg(depthView.nearZ, "NearZ"),
+                                          TLArg(depthView.farZ, "FarZ"),
+                                          TLArg(depthView.reversedZ, "ReversedZ"));
+                    }
                 }
 
-                // 2. Grab Current Depth
-                if (!m_depthSwapchains.empty()) {
-                    XrSwapchain depthChain = m_depthSwapchains[0];
-                    currentDepth = m_vulkanImages[depthChain][m_acquiredIndices[depthChain]];
+                VkImage currentColor = m_frameBroker.GetCurrentColorImage();
+                VkImage currentDepth = VK_NULL_HANDLE;
+
+                // 2. Grab Current Depth (prefer depth chained on projection views)
+                if (m_frameContext.depthViews[0].valid) {
+                    currentDepth = m_frameContext.depthViews[0].image;
+                } else if (m_frameContext.depthViews[1].valid) {
+                    currentDepth = m_frameContext.depthViews[1].image;
+                } else {
+                    currentDepth = m_frameBroker.GetCurrentDepthImage();
                 }
 
                 // 3. Process if we have a previous frame!
@@ -432,7 +680,11 @@ namespace openxr_api_layer {
                     // This removes camera rotation from the motion field, improving OFA quality.
 
                     // Dispatch to GPU. Do NOT wait for idle.
-                    m_processor->ProcessFrames(currentColor, currentDepth, m_prevColor, m_prevDepth);
+                    const bool submitted = m_processor->ProcessFrames(currentColor, currentDepth, m_prevColor, m_prevDepth);
+                    if (submitted) {
+                        m_synthesizedColor = currentColor;
+                        m_hasSynthesisOutput = true;
+                    }
                 }
 
                 // TODO: When OFA pipeline is integrated, invoke stereo vector adaptation here.
@@ -442,10 +694,100 @@ namespace openxr_api_layer {
                 // 4. Update our history buffers for the NEXT frame (t-1)
                 m_prevColor = currentColor;
                 m_prevDepth = currentDepth;
+
+                TraceLoggingWrite(g_traceProvider,
+                                  "Frame_Broker_State",
+                                  TLArg(currentColor != VK_NULL_HANDLE, "HasColor"),
+                                  TLArg(currentDepth != VK_NULL_HANDLE, "HasDepth"),
+                                  TLArg(m_hasSynthesisOutput, "HasSynthesisOutput"));
+            }
+
+            const XrFrameEndInfo* submitFrameEndInfo = frameEndInfo;
+            XrFrameEndInfo frameEndInfoCopy{};
+            std::vector<const XrCompositionLayerBaseHeader*> layerPointers;
+            std::vector<XrCompositionLayerProjection> projectionLayerCopies;
+            std::vector<std::vector<XrCompositionLayerProjectionView>> projectionViewCopies;
+
+            if (session == m_session && m_apiType == GraphicsAPI::Vulkan && frameEndInfo != nullptr &&
+                frameEndInfo->type == XR_TYPE_FRAME_END_INFO && frameEndInfo->layerCount > 0 && m_frameInjection.IsReady()) {
+                uint32_t injectionIndex = 0;
+                bool haveInjectionImage = false;
+
+                if (m_xrWaitSwapchainImage != nullptr && m_xrReleaseSwapchainImage != nullptr) {
+                    const XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                    const XrResult acquireResult = OpenXrApi::xrAcquireSwapchainImage(m_frameInjection.Swapchain(), &acquireInfo, &injectionIndex);
+                    if (XR_SUCCEEDED(acquireResult)) {
+                        const XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, nullptr, XR_INFINITE_DURATION};
+                        const XrResult waitResult = m_xrWaitSwapchainImage(m_frameInjection.Swapchain(), &waitInfo);
+                        if (XR_SUCCEEDED(waitResult)) {
+                            if (injectionIndex < m_injectionVulkanImages.size()) {
+                                const VkImage sourceColor = m_frameBroker.GetCurrentColorImage();
+                                const VkImage injectionColor = m_injectionVulkanImages[injectionIndex];
+                                haveInjectionImage = sourceColor != VK_NULL_HANDLE && injectionColor != VK_NULL_HANDLE &&
+                                                     m_processor != nullptr &&
+                                                     m_processor->CopyColorImage(sourceColor,
+                                                                                injectionColor,
+                                                                                m_frameBroker.GetSwapchainWidth(),
+                                                                                m_frameBroker.GetSwapchainHeight());
+                                if (haveInjectionImage) {
+                                    haveInjectionImage = m_processor->WaitForCopyCompletion();
+                                }
+                            }
+                        }
+
+                        const XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        const XrResult releaseResult = m_xrReleaseSwapchainImage(m_frameInjection.Swapchain(), &releaseInfo);
+                        if (XR_FAILED(releaseResult)) {
+                            TraceLoggingWrite(g_traceProvider,
+                                              "Injection_Release_Failed",
+                                              TLArg(xr::ToCString(releaseResult), "Result"));
+                        }
+                    }
+                }
+
+                if (haveInjectionImage) {
+                    projectionLayerCopies.reserve(frameEndInfo->layerCount);
+                    projectionViewCopies.reserve(frameEndInfo->layerCount);
+                    layerPointers.reserve(frameEndInfo->layerCount);
+
+                    for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
+                        const XrCompositionLayerBaseHeader* baseLayer = frameEndInfo->layers[i];
+                        if (baseLayer != nullptr && baseLayer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                            const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(baseLayer);
+                            projectionLayerCopies.push_back(*projection);
+                            projectionViewCopies.emplace_back();
+                            auto& viewsCopy = projectionViewCopies.back();
+                            viewsCopy.resize(projection->viewCount);
+                            if (projection->viewCount > 0 && projection->views != nullptr) {
+                                std::copy_n(projection->views, projection->viewCount, viewsCopy.begin());
+                            }
+
+                            auto& projectionCopy = projectionLayerCopies.back();
+                            for (auto& view : viewsCopy) {
+                                view.subImage.swapchain = m_frameInjection.Swapchain();
+                            }
+                            projectionCopy.views = viewsCopy.data();
+                            layerPointers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionCopy));
+                        } else {
+                            layerPointers.push_back(baseLayer);
+                        }
+                    }
+
+                    frameEndInfoCopy = *frameEndInfo;
+                    frameEndInfoCopy.layers = layerPointers.data();
+                    submitFrameEndInfo = &frameEndInfoCopy;
+                }
+
+                if (m_hasSynthesisOutput && m_synthesizedColor != VK_NULL_HANDLE) {
+                    TraceLoggingWrite(g_traceProvider,
+                                      "Frame_Injection_Ready",
+                                      TLArg(m_frameInjection.IsReady(), "InjectionSwapchainReady"),
+                                      TLArg(true, "SynthesisReady"));
+                }
             }
 
             // Finally, pass it back to the OpenXR runtime so it gets to the headset
-            return OpenXrApi::xrEndFrame(session, frameEndInfo);
+            return OpenXrApi::xrEndFrame(session, submitFrameEndInfo);
         }
 
 
@@ -458,18 +800,24 @@ namespace openxr_api_layer {
         XrSession m_session{XR_NULL_HANDLE};
 
         std::unique_ptr<VulkanFrameProcessor> m_processor;
+        FrameBroker m_frameBroker;
+        FrameInjection m_frameInjection;
+        PoseProvider m_poseProvider;
+        DepthProvider m_depthProvider;
+        FrameContext m_frameContext{};
+        PFN_xrWaitSwapchainImage m_xrWaitSwapchainImage{nullptr};
+        PFN_xrReleaseSwapchainImage m_xrReleaseSwapchainImage{nullptr};
+        bool m_depthWarningLogged{false};
+        VkImage m_synthesizedColor{VK_NULL_HANDLE};
+        bool m_hasSynthesisOutput{false};
 
         // Vulkan Tracking
         VkInstance m_vkInstance{VK_NULL_HANDLE};
         VkPhysicalDevice m_vkPhysicalDevice{VK_NULL_HANDLE};
         VkDevice m_vkDevice{VK_NULL_HANDLE};
         uint32_t m_vkQueueFamilyIndex{0};
-
-        // Frame Tracking
-        std::vector<XrSwapchain> m_colorSwapchains;
-        std::vector<XrSwapchain> m_depthSwapchains;
-        std::map<XrSwapchain, std::vector<VkImage>> m_vulkanImages;
-        std::map<XrSwapchain, uint32_t> m_acquiredIndices;
+        uint32_t m_vkQueueIndex{0};
+        std::vector<VkImage> m_injectionVulkanImages;
 
         // NEW: History tracking for Frame Generation/Warping
         VkImage m_prevColor{VK_NULL_HANDLE};
@@ -479,10 +827,6 @@ namespace openxr_api_layer {
         XrFovf m_fovLeft{};
         XrFovf m_fovRight{};
         bool m_fovInitialized{false};
-
-        // Swapchain resolution (for future stereo adapter initialization)
-        uint32_t m_swapchainWidth{0};
-        uint32_t m_swapchainHeight{0};
 
         // Placeholder: near/far planes for depth linearization (TODO: extract from projection matrix)
         // These are typical VR values; should be extracted from actual projection in future
