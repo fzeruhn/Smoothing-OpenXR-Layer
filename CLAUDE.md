@@ -62,11 +62,16 @@ Dependencies managed via NuGet (OpenXR headers/loader, fmt, WIL). CUDA and NVOf 
 - Validated end-to-end by `synthesis-test`: 256×256 checkerboard +16/+8 px translation, 100% central pixels within ±2/channel → **[PASS]**
 - **Known integration point — Reversed-Z depth:** Most modern engines (including likely Star Citizen) use Reversed-Z depth for precision (1.0 = near, 0.0 = far). The scatter kernel assumes standard depth (0.0 = near). If depth acquisition yields inverted visuals (background occludes foreground), invert depth in `kernel_scatter`: `depth = 1.0f - depth` before packing. This is a **TODO for live integration testing**.
 
+**Implemented (pose_warp — Roadmap Item 4 infrastructure complete):**
+- `pose_warp_math.h/.cpp` — Homography matrix computation from rotation quaternion and camera intrinsics (FOV). Handles asymmetric FOV, computes 3×3 homography for rotation-only warp.
+- `pose_warp.h/.cu` — `PoseWarper` RAII wrapper. CUDA kernel: backward warp with bilinear interpolation for sub-pixel accuracy. Interface: `warp(CUarray input, CUarray output, width, height, homography[9], stream)`.
+- Validated end-to-end by `pose-warp-test`: 256×256 checkerboard + 5° yaw rotation, >20% pixel change in central ROI → **[PASS]**
+- Layer integration: TODO comments in `layer.cpp` mark where pose extraction and pre-warp will be inserted when Item 2 (Pose Data Pipeline) is complete. **Integration blocked on Item 2.**
+
 **Not yet implemented (stubs/TODOs):**
 - Vulkan compute pipeline in VulkanFrameProcessor
-- 6DoF pose capture and usage (pre-warp, LSR) — Roadmap Item 2
+- 6DoF pose capture and usage (pre-warp, LSR) — Roadmap Item 2 **[BLOCKS Item 4 integration]**
 - Depth acquisition (XR_KHR_composition_layer_depth or alternative) — Roadmap Item 5
-- Pre-OFA pose pre-warp (homography) — Roadmap Item 4
 - Frame injection back to compositor via modified `xrEndFrame` — Roadmap Item 10
 - Hole filling (edge-directed interpolation) — Roadmap Item 9
 
@@ -87,7 +92,12 @@ openxr-api-layer/
   layer.cpp                    Main layer logic — OpenXR hooks live here
   layer.h                      Layer class definition
   vulkan_cuda_interop.h/.cpp   SharedImage + SharedSemaphore RAII wrappers (Roadmap Item 1)
+  ofa_pipeline.h/.cpp          OFAPipeline RAII + NvOF 5.0.7 integration (Roadmap Item 3)
+  pose_warp_math.h/.cpp        Homography computation (Roadmap Item 4 infrastructure)
+  pose_warp.h/.cu              PoseWarper RAII + CUDA warp kernel (Roadmap Item 4 infrastructure)
   frame_synthesizer.h/.cu      FrameSynthesizer RAII + CUDA kernels (Roadmap Item 7)
+  stereo_vector_adapter.h/.cu  StereoVectorAdapter RAII + depth-based adaptation (Roadmap Item 8)
+  hole_filler.h/.cu            HoleFiller RAII + push-pull inpainting (Roadmap Item 9)
   pch.h / pch.cpp              Precompiled headers
   framework/
     dispatch.h/.cpp            OpenXR function dispatch (template framework)
@@ -108,6 +118,29 @@ interop-test/
 ofa-test/
   main.cpp                     OFA end-to-end test: random noise frames, shift validation, PNG output
   stb_image_write.h            Header-only PNG writer
+  ofa-test.vcxproj             Standalone console app; uses CUDA 13.2 build customizations
+synthesis-test/
+  main.cpp                     Bidirectional synthesis end-to-end test: checkerboard +16/+8 shift, validation
+  synthesis-test.vcxproj       Standalone console app; uses CUDA 13.2 build customizations
+stereo-adapter-test/
+  main.cpp                     Stereo vector adaptation test: synthetic depth layers, L→R adaptation validation
+  stereo-adapter-test.vcxproj  Standalone console app; uses CUDA 13.2 build customizations
+hole-fill-test/
+  main.cpp                     Push-pull hole filling test: synthetic holes, gradient validation
+  hole-fill-test.vcxproj       Standalone console app; uses CUDA 13.2 build customizations
+pose-warp-test/
+  main.cpp                     Pose warp test: checkerboard + 5° yaw rotation, pixel change validation
+  pose-warp-test.vcxproj       Standalone console app; uses CUDA 13.2 build customizations
+external/
+  OpenXR-SDK/                  Khronos OpenXR SDK (submodule)
+  OpenXR-SDK-Source/           Khronos OpenXR SDK source (submodule)
+  OpenXR-MixedReality/         Microsoft OpenXR MixedReality (submodule)
+  PVR/                         Pimax SDK, to be used for better eye tracking data
+scripts/
+  Install-Layer.ps1            Registers the layer in the Windows registry
+  Uninstall-Layer.ps1          Unregisters the layer
+  Tracing.wprp                 WPR trace capture profile
+```
   ofa-test.vcxproj             Standalone console app; uses CUDA 13.2 build customizations
 synthesis-test/
   main.cpp                     Bidirectional synthesis end-to-end test: checkerboard +16/+8 shift, validation

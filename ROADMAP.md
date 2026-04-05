@@ -62,7 +62,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 4. Pre-OFA Pose Pre-warp - Can be done headless
+## 4. Pre-OFA Pose Pre-warp - Can be done headless ✅ INFRASTRUCTURE COMPLETE
 
 **Goal:** Apply pose delta to frame N−1 before feeding to OFA, so that OFA sees only scene-relative motion.
 
@@ -70,6 +70,14 @@ Each item is listed in dependency order. Complete earlier items before starting 
 - Compute homography matrix from `pose_delta` (from item 2) and camera intrinsics (FOV from `xrEndFrame`)
 - Apply homography warp to previous frame as a CUDA kernel (to keep memory in the current execution context) before OFA execution
 - Compare OFA vector field quality with and without pre-warp (smoother, smaller magnitude in static scenes)
+
+**Delivered:** 
+- `openxr-api-layer/pose_warp_math.h/.cpp` — Homography computation from rotation quaternion and camera intrinsics. Handles asymmetric FOV via `computeIntrinsics()`. Matrix inversion for backward warping.
+- `openxr-api-layer/pose_warp.h/.cu` — `PoseWarper` RAII wrapper. CUDA kernel: backward warp with bilinear interpolation, sub-pixel accuracy. Interface: `warp(CUarray input, CUarray output, width, height, homography[9], stream)`.
+- `pose-warp-test/` — Headless validation test exe. Synthetic checkerboard + 5° yaw rotation. Pass: >20% pixel change in central ROI.
+- Layer integration prep: TODO comments in `layer.cpp` mark where pose extraction and pre-warp will be inserted when Item 2 (Pose Data Pipeline) is complete.
+
+**Note:** Final integration is **blocked** on Item 2 (Pose Data Pipeline). Infrastructure is ready; just needs pose delta extraction from xrEndFrame projection layer poses.
 
 **Why fourth:** Improves OFA quality across the whole pipeline. Build on top of validated OFA from item 3.
 

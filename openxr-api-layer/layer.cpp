@@ -37,6 +37,10 @@
 #include <openxr/openxr_platform.h>
 #include <map>       // For tracking image indices
 
+// TODO (Item 4): Uncomment when pose warp is fully integrated
+// #include "pose_warp.h"
+// #include "pose_warp_math.h"
+
 
 namespace openxr_api_layer {
 
@@ -399,6 +403,17 @@ namespace openxr_api_layer {
 
                 // 3. Process if we have a previous frame!
                 if (m_processor && currentColor && currentDepth && m_prevColor && m_prevDepth) {
+                    // TODO (Item 4): Pre-OFA pose pre-warp
+                    // When Item 2 (Pose Data Pipeline) is complete:
+                    //   1. Extract XrPosef render_pose and display_pose from frameEndInfo projection layers
+                    //   2. Compute pose_delta = display_pose * inverse(render_pose)
+                    //   3. Extract rotation quaternion from pose_delta
+                    //   4. Compute homography from rotation and m_fovLeft (using pose_warp_math::computeIntrinsics)
+                    //   5. Create temporary CUarrays from m_prevColor via Vulkan/CUDA interop
+                    //   6. Call m_poseWarper->warp() to apply homography to m_prevColor
+                    //   7. Feed warped frame to OFA (when OFA integration is complete)
+                    // This removes camera rotation from the motion field, improving OFA quality.
+
                     // Dispatch to GPU. Do NOT wait for idle.
                     m_processor->ProcessFrames(currentColor, currentDepth, m_prevColor, m_prevDepth);
                 }
@@ -457,6 +472,15 @@ namespace openxr_api_layer {
         static constexpr float NEAR_PLANE = 0.1f;
         static constexpr float FAR_PLANE = 100.0f;
         static constexpr float IPD = 0.063f; // 63mm typical; TODO: query from runtime API
+
+        // TODO (Item 4): Pre-OFA pose pre-warp integration
+        // When Item 2 (Pose Data Pipeline) is complete:
+        //   1. Add std::unique_ptr<pose_warp::PoseWarper> m_poseWarper;
+        //   2. Uncomment pose warp includes at top of file
+        //   3. Extract pose delta in xrEndFrame (display_pose * inverse(render_pose))
+        //   4. Compute homography from pose delta and FOV (m_fovLeft/m_fovRight)
+        //   5. Call m_poseWarper->warp() on m_prevColor before feeding to OFA
+        // This will significantly improve OFA quality by removing camera motion from flow field.
     };
 
     // This method is required by the framework to instantiate your OpenXrApi implementation.
