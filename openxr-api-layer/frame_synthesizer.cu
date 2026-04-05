@@ -54,9 +54,12 @@ static CUtexObject makeTexObject(CUarray arr, bool normalizedFloat)
     td.addressMode[0] = CU_TR_ADDRESS_MODE_CLAMP;
     td.addressMode[1] = CU_TR_ADDRESS_MODE_CLAMP;
     td.filterMode     = CU_TR_FILTER_MODE_LINEAR;
-    // CU_TRSF_READ_AS_INTEGER suppresses normalisation and disables linear
-    // filtering — must be off for bilinear RGBA8 reads.
-    td.flags = normalizedFloat ? 0u : CU_TRSF_READ_AS_INTEGER;
+    // For RGBA8 (normalizedFloat=true): flags=0 keeps the default behaviour where
+    // uint8 channel values are promoted to float [0,1] by the texture hardware.
+    // For R32F depth (normalizedFloat=false): flags=0 as well — CU_TRSF_READ_AS_INTEGER
+    // is only defined for integer-type arrays and must not be set on float arrays.
+    // Filtering mode is controlled by td.filterMode above, not by this flag.
+    td.flags = 0u;
 
     CUtexObject tex = 0;
     CHECK_CU(cuTexObjectCreate(&tex, &rd, &td, nullptr));

@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <type_traits>
 
 // ---------------------------------------------------------------------------
 // Error-check macros (guarded so they can coexist with ofa_pipeline.h)
@@ -39,6 +40,17 @@ struct SynthFlowVector {
     int16_t flowx;
     int16_t flowy;
 };
+
+// NV_OF_FLOW_VECTOR is { int16_t flowx; int16_t flowy; } — 4 bytes, same layout.
+// These asserts verify binary compatibility without requiring NvOF headers here.
+static_assert(sizeof(SynthFlowVector) == 4,
+    "SynthFlowVector size mismatch with NV_OF_FLOW_VECTOR (expected 4 bytes)");
+static_assert(offsetof(SynthFlowVector, flowx) == 0,
+    "SynthFlowVector::flowx offset mismatch");
+static_assert(offsetof(SynthFlowVector, flowy) == 2,
+    "SynthFlowVector::flowy offset mismatch");
+static_assert(std::is_trivially_copyable_v<SynthFlowVector>,
+    "SynthFlowVector must be trivially copyable for memcpy from OFA output buffer");
 
 // ---------------------------------------------------------------------------
 // FrameSynthesizer

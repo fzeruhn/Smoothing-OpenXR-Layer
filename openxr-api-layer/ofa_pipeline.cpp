@@ -22,7 +22,10 @@ namespace {
 typedef NV_OF_STATUS(NVOFAPI *PFNNvOFAPICreateInstanceCuda)(
     uint32_t apiVer, NV_OF_CUDA_API_FUNCTION_LIST* functionList);
 
-PFNNvOFAPICreateInstanceCuda loadEntryPoint() {
+// Loads nvofapi64.dll, stores the module handle in *outModule, and returns the
+// NvOFAPICreateInstanceCuda function pointer.  The caller is responsible for
+// calling FreeLibrary(*outModule) when done.
+PFNNvOFAPICreateInstanceCuda loadEntryPoint(void** outModule) {
 #ifdef _WIN32
     HMODULE hMod = LoadLibraryA("nvofapi64.dll");
     if (!hMod)
@@ -31,12 +34,16 @@ PFNNvOFAPICreateInstanceCuda loadEntryPoint() {
             "or the driver version is too old (Turing or later required).");
     auto fn = reinterpret_cast<PFNNvOFAPICreateInstanceCuda>(
         GetProcAddress(hMod, "NvOFAPICreateInstanceCuda"));
-    if (!fn)
+    if (!fn) {
+        FreeLibrary(hMod);
         throw std::runtime_error(
             "NvOFAPICreateInstanceCuda not found in nvofapi64.dll — "
             "driver does not expose the OFA CUDA API.");
+    }
+    *outModule = static_cast<void*>(hMod);
     return fn;
 #else
+    (void)outModule;
     throw std::runtime_error("OFAPipeline: only Windows is supported.");
 #endif
 }
@@ -59,7 +66,7 @@ OFAPipeline::OFAPipeline(CUcontext ctx,
 {
     // 1. Dynamically load NvOF function pointer table from the driver DLL.
     // NV_OF_CUDA_API_FUNCTION_LIST has no .size field — zero-init is correct.
-    auto NvOFAPICreateInstanceCuda = loadEntryPoint();
+    auto NvOFAPICreateInstanceCuda = loadEntryPoint(&m_hModule);
     CHECK_NVOF_INIT(NvOFAPICreateInstanceCuda(NV_OF_API_VERSION, &m_api));
 
     // 2. Create OFA instance bound to CUDA context.
@@ -112,6 +119,10 @@ void OFAPipeline::destroy() noexcept {
     if (m_inputBufs[1]) { m_api.nvOFDestroyGPUBufferCuda(m_inputBufs[1]); m_inputBufs[1] = nullptr; }
     if (m_inputBufs[0]) { m_api.nvOFDestroyGPUBufferCuda(m_inputBufs[0]); m_inputBufs[0] = nullptr; }
     if (m_hOf)          { m_api.nvOFDestroy(m_hOf);                        m_hOf          = nullptr; }
+    // Release the DLL reference. m_api function pointers become invalid after this.
+#ifdef _WIN32
+    if (m_hModule)      { FreeLibrary(static_cast<HMODULE>(m_hModule));    m_hModule      = nullptr; }
+#endif
 }
 
 // -------------------------------------------------------------------------

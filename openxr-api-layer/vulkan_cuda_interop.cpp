@@ -39,6 +39,13 @@ SharedImage::SharedImage(VkDevice device, VkPhysicalDevice physDevice,
                          uint32_t width, uint32_t height, VkFormat format)
     : m_device(device), m_width(width), m_height(height) {
 
+    // The CUDA array descriptor below is hardcoded for RGBA8 (CU_AD_FORMAT_UNSIGNED_INT8,
+    // 4 channels). Other formats require a different descriptor and are not supported.
+    if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_R8G8B8A8_SRGB)
+        throw std::runtime_error(
+            "SharedImage: only VK_FORMAT_R8G8B8A8_UNORM/SRGB are supported — "
+            "CUDA array descriptor is hardcoded for RGBA8");
+
     // Extension functions are not linked directly — load at runtime.
     auto fnGetMemoryHandle =
         reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
