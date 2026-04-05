@@ -21,6 +21,7 @@ struct FrameContext {
         float maxDepth{1.0f};
         float nearZ{0.0f};
         float farZ{0.0f};
+        bool reversedZ{false};
         bool valid{false};
     };
 

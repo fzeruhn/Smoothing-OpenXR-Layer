@@ -3,10 +3,10 @@
 
 namespace openxr_api_layer {
 
-void DepthProvider::SetSwapchainImageLookup(const std::map<XrSwapchain, std::vector<VkImage>>* vulkanImages,
-                                            const std::map<XrSwapchain, uint32_t>* acquiredIndices) {
-    m_vulkanImages = vulkanImages;
-    m_acquiredIndices = acquiredIndices;
+void DepthProvider::SetSwapchainImageLookup(const std::map<XrSwapchain, std::vector<VkImage>>& vulkanImages,
+                                            const std::map<XrSwapchain, uint32_t>& acquiredIndices) {
+    m_vulkanImages = &vulkanImages;
+    m_acquiredIndices = &acquiredIndices;
 }
 
 const XrCompositionLayerDepthInfoKHR* DepthProvider::FindDepthInfo(const XrCompositionLayerProjectionView& view) const {
@@ -50,6 +50,7 @@ void DepthProvider::ExtractDepthInfo(const XrCompositionLayerProjection& project
         dst.maxDepth = depthInfo->maxDepth;
         dst.nearZ = depthInfo->nearZ;
         dst.farZ = depthInfo->farZ;
+        dst.reversedZ = depthInfo->nearZ > depthInfo->farZ;
         dst.valid = true;
     }
 }

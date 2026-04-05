@@ -7,8 +7,8 @@ namespace openxr_api_layer {
 
 class DepthProvider {
   public:
-    void SetSwapchainImageLookup(const std::map<XrSwapchain, std::vector<VkImage>>* vulkanImages,
-                                 const std::map<XrSwapchain, uint32_t>* acquiredIndices);
+    void SetSwapchainImageLookup(const std::map<XrSwapchain, std::vector<VkImage>>& vulkanImages,
+                                 const std::map<XrSwapchain, uint32_t>& acquiredIndices);
     void ExtractDepthInfo(const XrCompositionLayerProjection& projectionLayer, FrameContext& frameContext) const;
 
   private:

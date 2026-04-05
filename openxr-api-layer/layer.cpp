@@ -26,6 +26,7 @@
 #include "pch.h"
 #include "layer.h"
 #include "depth_provider.h"
+#include "frame_broker.h"
 #include "frame_context.h"
 #include "pose_provider.h"
 #include <log.h>
@@ -153,9 +154,7 @@ namespace openxr_api_layer {
     // This class implements our API layer.
     class OpenXrLayer : public openxr_api_layer::OpenXrApi {
       public:
-        OpenXrLayer() {
-            m_depthProvider.SetSwapchainImageLookup(&m_vulkanImages, &m_acquiredIndices);
-        }
+        OpenXrLayer() = default;
         ~OpenXrLayer() = default;
 
         // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetInstanceProcAddr
@@ -300,20 +299,18 @@ namespace openxr_api_layer {
             if (XR_SUCCEEDED(result) && session == m_session && m_apiType == GraphicsAPI::Vulkan) {
                 // Get color
                 if (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) {
+                    const uint32_t previousWidth = m_frameBroker.GetSwapchainWidth();
+                    const uint32_t previousHeight = m_frameBroker.GetSwapchainHeight();
+                    m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
                     Log(fmt::format("Intercepted Color Swapchain Creation! Width: {} Height: {}\n", createInfo->width, createInfo->height));
-                    // Save this swapchain handle so we know to track its images
-                    m_colorSwapchains.push_back(*swapchain);
 
                     // Store swapchain resolution for future stereo-adapter wiring.
-                    if (m_swapchainWidth != 0 && m_swapchainHeight != 0 &&
-                        (m_swapchainWidth != createInfo->width || m_swapchainHeight != createInfo->height)) {
+                    if (previousWidth != 0 && previousHeight != 0 &&
+                        (previousWidth != createInfo->width || previousHeight != createInfo->height)) {
                         Log(fmt::format("[WARN] Color swapchain resolution changed from {}x{} to {}x{}; "
                             "future stereo adaptation must use per-swapchain dimensions\n",
-                            m_swapchainWidth, m_swapchainHeight, createInfo->width, createInfo->height));
+                            previousWidth, previousHeight, createInfo->width, createInfo->height));
                     }
-
-                    m_swapchainWidth = createInfo->width;
-                    m_swapchainHeight = createInfo->height;
 
                     // Initialize the processor
                     if (!m_processor && m_vkDevice != VK_NULL_HANDLE) {
@@ -326,8 +323,8 @@ namespace openxr_api_layer {
 
                 // Get depth
                 } else if (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+                    m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
                     Log(fmt::format("Intercepted Depth Swapchain! Width: {} Height: {}\n", createInfo->width, createInfo->height));
-                    m_depthSwapchains.push_back(*swapchain);
                 }
             }
             return result;
@@ -342,17 +339,8 @@ namespace openxr_api_layer {
                 OpenXrApi::xrEnumerateSwapchainImages(swapchain, imageCapacityInput, imageCountOutput, images);
 
             if (XR_SUCCEEDED(result) && images != nullptr && m_apiType == GraphicsAPI::Vulkan) {
-                // If this is a color or depth swapchain we care about...
-                bool isTracked =
-                    std::find(m_colorSwapchains.begin(), m_colorSwapchains.end(), swapchain) !=
-                        m_colorSwapchains.end() ||
-                    std::find(m_depthSwapchains.begin(), m_depthSwapchains.end(), swapchain) != m_depthSwapchains.end();
-
-                if (isTracked) {
-                    XrSwapchainImageVulkanKHR* vkImages = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
-                    for (uint32_t i = 0; i < *imageCountOutput; i++) {
-                        m_vulkanImages[swapchain].push_back(vkImages[i].image);
-                    }
+                if (m_frameBroker.IsColorSwapchain(swapchain) || m_frameBroker.IsDepthSwapchain(swapchain)) {
+                    m_frameBroker.RegisterSwapchainImages(swapchain, *imageCountOutput, images);
                     Log(fmt::format("Mapped {} Vulkan images for swapchain.\n", *imageCountOutput));
                 }
             }
@@ -365,7 +353,7 @@ namespace openxr_api_layer {
                                          uint32_t* index) override {
             XrResult result = OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
             if (XR_SUCCEEDED(result)) {
-                m_acquiredIndices[swapchain] = *index; // Remember this index for EndFrame
+                m_frameBroker.OnAcquireSwapchainImage(swapchain, *index); // Remember this index for EndFrame
             }
             return result;
         }
@@ -425,6 +413,7 @@ namespace openxr_api_layer {
                 }
 
                 if (projectionLayer) {
+                    m_depthProvider.SetSwapchainImageLookup(m_frameBroker.GetVulkanImages(), m_frameBroker.GetAcquiredIndices());
                     const XrResult poseResult =
                         m_poseProvider.PopulatePredictedViews(*this, session, *projectionLayer, m_frameContext);
                     if (XR_FAILED(poseResult)) {
@@ -439,25 +428,29 @@ namespace openxr_api_layer {
                         m_depthWarningLogged = true;
                         Log("[WARN] No XR_KHR_composition_layer_depth info on projection views; using tracked depth swapchains.\n");
                     }
+
+                    if (hasDepthChain) {
+                        const auto& depthView = m_frameContext.depthViews[0].valid ? m_frameContext.depthViews[0] : m_frameContext.depthViews[1];
+                        TraceLoggingWrite(g_traceProvider,
+                                          "Depth_Metadata",
+                                          TLArg(depthView.minDepth, "MinDepth"),
+                                          TLArg(depthView.maxDepth, "MaxDepth"),
+                                          TLArg(depthView.nearZ, "NearZ"),
+                                          TLArg(depthView.farZ, "FarZ"),
+                                          TLArg(depthView.reversedZ, "ReversedZ"));
+                    }
                 }
 
-                VkImage currentColor = VK_NULL_HANDLE;
+                VkImage currentColor = m_frameBroker.GetCurrentColorImage();
                 VkImage currentDepth = VK_NULL_HANDLE;
-
-                // 1. Grab Current Color
-                if (!m_colorSwapchains.empty()) {
-                    XrSwapchain colorChain = m_colorSwapchains[0];
-                    currentColor = m_vulkanImages[colorChain][m_acquiredIndices[colorChain]];
-                }
 
                 // 2. Grab Current Depth (prefer depth chained on projection views)
                 if (m_frameContext.depthViews[0].valid) {
                     currentDepth = m_frameContext.depthViews[0].image;
                 } else if (m_frameContext.depthViews[1].valid) {
                     currentDepth = m_frameContext.depthViews[1].image;
-                } else if (!m_depthSwapchains.empty()) {
-                    XrSwapchain depthChain = m_depthSwapchains[0];
-                    currentDepth = m_vulkanImages[depthChain][m_acquiredIndices[depthChain]];
+                } else {
+                    currentDepth = m_frameBroker.GetCurrentDepthImage();
                 }
 
                 // 3. Process if we have a previous frame!
@@ -475,6 +468,8 @@ namespace openxr_api_layer {
 
                     // Dispatch to GPU. Do NOT wait for idle.
                     m_processor->ProcessFrames(currentColor, currentDepth, m_prevColor, m_prevDepth);
+                    m_synthesizedColor = currentColor;
+                    m_hasSynthesisOutput = true;
                 }
 
                 // TODO: When OFA pipeline is integrated, invoke stereo vector adaptation here.
@@ -484,6 +479,18 @@ namespace openxr_api_layer {
                 // 4. Update our history buffers for the NEXT frame (t-1)
                 m_prevColor = currentColor;
                 m_prevDepth = currentDepth;
+
+                TraceLoggingWrite(g_traceProvider,
+                                  "Frame_Broker_State",
+                                  TLArg(currentColor != VK_NULL_HANDLE, "HasColor"),
+                                  TLArg(currentDepth != VK_NULL_HANDLE, "HasDepth"),
+                                  TLArg(m_hasSynthesisOutput, "HasSynthesisOutput"));
+            }
+
+            // Item 10 wiring stage: keep runtime submission unchanged for now while reporting
+            // synthesis readiness. Actual layer replacement/injection is next step.
+            if (m_hasSynthesisOutput && m_synthesizedColor != VK_NULL_HANDLE) {
+                TraceLoggingWrite(g_traceProvider, "Frame_Injection_Ready", TLArg(true, "Ready"));
             }
 
             // Finally, pass it back to the OpenXR runtime so it gets to the headset
@@ -500,22 +507,19 @@ namespace openxr_api_layer {
         XrSession m_session{XR_NULL_HANDLE};
 
         std::unique_ptr<VulkanFrameProcessor> m_processor;
+        FrameBroker m_frameBroker;
         PoseProvider m_poseProvider;
         DepthProvider m_depthProvider;
         FrameContext m_frameContext{};
         bool m_depthWarningLogged{false};
+        VkImage m_synthesizedColor{VK_NULL_HANDLE};
+        bool m_hasSynthesisOutput{false};
 
         // Vulkan Tracking
         VkInstance m_vkInstance{VK_NULL_HANDLE};
         VkPhysicalDevice m_vkPhysicalDevice{VK_NULL_HANDLE};
         VkDevice m_vkDevice{VK_NULL_HANDLE};
         uint32_t m_vkQueueFamilyIndex{0};
-
-        // Frame Tracking
-        std::vector<XrSwapchain> m_colorSwapchains;
-        std::vector<XrSwapchain> m_depthSwapchains;
-        std::map<XrSwapchain, std::vector<VkImage>> m_vulkanImages;
-        std::map<XrSwapchain, uint32_t> m_acquiredIndices;
 
         // NEW: History tracking for Frame Generation/Warping
         VkImage m_prevColor{VK_NULL_HANDLE};
@@ -525,10 +529,6 @@ namespace openxr_api_layer {
         XrFovf m_fovLeft{};
         XrFovf m_fovRight{};
         bool m_fovInitialized{false};
-
-        // Swapchain resolution (for future stereo adapter initialization)
-        uint32_t m_swapchainWidth{0};
-        uint32_t m_swapchainHeight{0};
 
         // Placeholder: near/far planes for depth linearization (TODO: extract from projection matrix)
         // These are typical VR values; should be extracted from actual projection in future
