@@ -2,6 +2,7 @@
 
 #include "frame_context.h"
 #include <map>
+#include <vector>
 
 namespace openxr_api_layer {
 
