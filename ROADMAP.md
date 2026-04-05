@@ -178,6 +178,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 - Build modified `XrFrameEndInfo`: replace projection layer swapchain reference with synthetic swapchain
 - For 2× synthesis (45→90): call downstream `xrEndFrame` twice — once with real frame (T), once with synthetic frame (T+0.5) — each with correct `predictedDisplayTime`
 - Handle image layout transitions to `XR_SWAPCHAIN_IMAGE_LAYOUT_COLOR_OPTIMAL` before submission
+- If possible, submit the frame along with its calculated depth to allow the runtime to perform its own reprojection
 
 **Why tenth:** Frame submission requires all upstream pipeline stages to produce valid output. Integrate last, after synthesis quality is validated offline.
 
