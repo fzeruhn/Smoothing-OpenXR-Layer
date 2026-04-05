@@ -625,7 +625,9 @@ namespace openxr_api_layer {
                 }
 
                 if (projectionLayer) {
-                    m_frameInjection.EnsureSwapchain(*this, session, m_frameBroker);
+                    if (m_enableFrameRewrite) {
+                        m_frameInjection.EnsureSwapchain(*this, session, m_frameBroker);
+                    }
                     m_depthProvider.SetSwapchainImageLookup(m_frameBroker.GetVulkanImages(), m_frameBroker.GetAcquiredIndices());
                     const XrResult poseResult =
                         m_poseProvider.PopulatePredictedViews(*this, session, *projectionLayer, m_frameContext);
@@ -708,7 +710,7 @@ namespace openxr_api_layer {
             std::vector<XrCompositionLayerProjection> projectionLayerCopies;
             std::vector<std::vector<XrCompositionLayerProjectionView>> projectionViewCopies;
 
-            if (session == m_session && m_apiType == GraphicsAPI::Vulkan && frameEndInfo != nullptr &&
+            if (m_enableFrameRewrite && session == m_session && m_apiType == GraphicsAPI::Vulkan && frameEndInfo != nullptr &&
                 frameEndInfo->type == XR_TYPE_FRAME_END_INFO && frameEndInfo->layerCount > 0 && m_frameInjection.IsReady()) {
                 uint32_t injectionIndex = 0;
                 bool haveInjectionImage = false;
@@ -802,6 +804,7 @@ namespace openxr_api_layer {
         std::unique_ptr<VulkanFrameProcessor> m_processor;
         FrameBroker m_frameBroker;
         FrameInjection m_frameInjection;
+        bool m_enableFrameRewrite{false};
         PoseProvider m_poseProvider;
         DepthProvider m_depthProvider;
         FrameContext m_frameContext{};
