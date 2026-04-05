@@ -10,21 +10,29 @@ namespace pose_warp {
 
 CameraIntrinsics computeIntrinsics(float fovLeft, float fovRight, float fovUp, float fovDown,
                                    int width, int height) {
-    // Compute horizontal and vertical FOV from asymmetric FOV angles
-    const float fovHorizontal = fovLeft + fovRight;
-    const float fovVertical = fovUp + fovDown;
-    
-    // Compute focal lengths in pixels
-    // fx = width / (2 * tan(fovHorizontal / 2))
-    const float fx = static_cast<float>(width) / (2.0f * std::tan(fovHorizontal / 2.0f));
-    const float fy = static_cast<float>(height) / (2.0f * std::tan(fovVertical / 2.0f));
-    
-    // Compute principal point (optical center)
-    // For asymmetric FOV, principal point is offset from image center
-    const float cx = static_cast<float>(width) / 2.0f + fx * std::tan((fovRight - fovLeft) / 2.0f);
-    const float cy = static_cast<float>(height) / 2.0f + fy * std::tan((fovDown - fovUp) / 2.0f);
+    const float tanLeft = std::tan(fovLeft);
+    const float tanRight = std::tan(fovRight);
+    const float tanUp = std::tan(fovUp);
+    const float tanDown = std::tan(fovDown);
+
+    const float denomX = tanLeft + tanRight;
+    const float denomY = tanUp + tanDown;
+    if (std::abs(denomX) < 1e-8f || std::abs(denomY) < 1e-8f) {
+        throw std::invalid_argument("computeIntrinsics: invalid FOV angles");
+    }
+
+    const float fx = static_cast<float>(width) / denomX;
+    const float fy = static_cast<float>(height) / denomY;
+
+    // Principal point measured from image top-left in pixel coordinates.
+    const float cx = fx * tanLeft;
+    const float cy = fy * tanUp;
     
     return CameraIntrinsics{fx, fy, cx, cy};
+}
+
+CameraIntrinsics computeIntrinsics(const XrFovf& fov, int width, int height) {
+    return computeIntrinsics(-fov.angleLeft, fov.angleRight, fov.angleUp, -fov.angleDown, width, height);
 }
 
 void quaternionToMatrix3x3(const XrQuaternionf& q, float R[9]) {

@@ -4,7 +4,7 @@
 //   Transform: 5° yaw rotation (rotation around Y axis)
 //   Expected output: Rotated checkerboard with bilinear interpolation
 //
-// Pass criteria: Central 80% of pixels within ±5 units of expected warp
+// Pass criteria: At least 20% of central ROI pixels differ from input
 
 #include "pose_warp.h"
 #include "pose_warp_math.h"
@@ -28,13 +28,13 @@ static constexpr int H = 256;
 static constexpr float YAW_DEG = 5.0f;  // 5° yaw rotation
 static constexpr float YAW_RAD = YAW_DEG * 3.14159265f / 180.0f;
 
-// Pass criteria: central 80% of pixels within ±5 units
+// Central 80% ROI used for change detection
 static constexpr int MARGIN = W / 10;  // 10% margin = 25 pixels
 static constexpr int ROI_X0 = MARGIN;
 static constexpr int ROI_Y0 = MARGIN;
 static constexpr int ROI_X1 = W - MARGIN;
 static constexpr int ROI_Y1 = H - MARGIN;
-static constexpr int TOLERANCE = 5;  // per-channel tolerance
+static constexpr float MIN_CHANGED_PERCENT = 20.0f;
 
 // Helper: Create quaternion for yaw rotation (rotation around Y axis)
 static XrQuaternionf makeYawRotation(float yaw_rad) {
@@ -124,7 +124,7 @@ int main() {
     printf("=== Pose Warp Test ===\n");
     printf("Input: %dx%d checkerboard\n", W, H);
     printf("Transform: %.1f° yaw rotation\n", YAW_DEG);
-    printf("Validation: central 80%% within ±%d units\n\n", TOLERANCE);
+    printf("Validation: central ROI changed pixels >= %.1f%%\n\n", MIN_CHANGED_PERCENT);
 
     // -----------------------------------------------------------------------
     // CUDA init
@@ -287,7 +287,7 @@ int main() {
 
     // For a 5° rotation, we expect significant pixel changes due to shift
     // Accept if at least 20% of central pixels changed
-    if (percentChanged < 20.0f) {
+    if (percentChanged < MIN_CHANGED_PERCENT) {
         printf("[FAIL] Too few pixels changed (expected warp effect)\n");
         return 1;
     }

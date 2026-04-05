@@ -15,10 +15,19 @@ struct CameraIntrinsics {
     float cy;  // principal point Y (pixels)
 };
 
-// Compute camera intrinsics from OpenXR FOV and image dimensions
-// FOV angles are in radians, as provided by XrFovf
+// Compute camera intrinsics from asymmetric FOV magnitudes and image dimensions.
+//
+// Inputs are positive angular magnitudes in radians from optical axis to each edge:
+//   fovLeft  = |angleLeft|, fovRight = angleRight,
+//   fovUp    = angleUp,      fovDown  = |angleDown|
+//
+// For raw OpenXR signed angles, prefer the XrFovf overload below.
 CameraIntrinsics computeIntrinsics(float fovLeft, float fovRight, float fovUp, float fovDown,
                                    int width, int height);
+
+// Compute camera intrinsics directly from OpenXR signed FOV angles.
+// Handles OpenXR convention where angleLeft/angleDown are negative.
+CameraIntrinsics computeIntrinsics(const XrFovf& fov, int width, int height);
 
 // Compute 3x3 homography matrix for rotation-only warp
 // rotation: quaternion representing pose delta (display_pose * inverse(render_pose))

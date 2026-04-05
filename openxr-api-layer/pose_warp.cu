@@ -8,6 +8,8 @@
 
 namespace pose_warp {
 
+bool invertHomography(const float H[9], float H_inv[9]);
+
 // CUDA kernel: Apply homography warp with bilinear interpolation
 // Uses backward warping: iterate output pixels, sample input via H^-1
 __global__ void kernel_homography_warp(
@@ -104,34 +106,6 @@ static void launch_homography_warp(
     }
 }
 
-// Helper: invert 3x3 matrix
-static bool invert3x3(const float A[9], float A_inv[9]) {
-    const float det = A[0] * (A[4] * A[8] - A[5] * A[7])
-                    - A[1] * (A[3] * A[8] - A[5] * A[6])
-                    + A[2] * (A[3] * A[7] - A[4] * A[6]);
-
-    constexpr float epsilon = 1e-10f;
-    if (fabsf(det) < epsilon) {
-        return false;
-    }
-
-    const float det_inv = 1.0f / det;
-
-    A_inv[0] = (A[4] * A[8] - A[5] * A[7]) * det_inv;
-    A_inv[1] = (A[2] * A[7] - A[1] * A[8]) * det_inv;
-    A_inv[2] = (A[1] * A[5] - A[2] * A[4]) * det_inv;
-
-    A_inv[3] = (A[5] * A[6] - A[3] * A[8]) * det_inv;
-    A_inv[4] = (A[0] * A[8] - A[2] * A[6]) * det_inv;
-    A_inv[5] = (A[2] * A[3] - A[0] * A[5]) * det_inv;
-
-    A_inv[6] = (A[3] * A[7] - A[4] * A[6]) * det_inv;
-    A_inv[7] = (A[1] * A[6] - A[0] * A[7]) * det_inv;
-    A_inv[8] = (A[0] * A[4] - A[1] * A[3]) * det_inv;
-
-    return true;
-}
-
 // PoseWarper implementation
 PoseWarper::PoseWarper() {
     // Nothing to initialize at construction time
@@ -164,7 +138,7 @@ void PoseWarper::warp(CUarray input, CUarray output,
                       CUstream stream) {
     // Step 1: Invert homography for backward warping
     float H_inv[9];
-    if (!invert3x3(homography, H_inv)) {
+    if (!invertHomography(homography, H_inv)) {
         throw std::runtime_error("PoseWarper::warp: homography matrix is singular");
     }
 
