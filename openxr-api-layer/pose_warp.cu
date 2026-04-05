@@ -176,13 +176,13 @@ void PoseWarper::warp(CUarray input, CUarray output,
     cudaSurfaceObject_t inputSurf = 0;
     cudaSurfaceObject_t outputSurf = 0;
 
-    resDesc.res.array.array = input;
+    resDesc.res.array.array = reinterpret_cast<cudaArray_t>(input);
     cudaError_t err = cudaCreateSurfaceObject(&inputSurf, &resDesc);
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("Failed to create input surface: ") + cudaGetErrorString(err));
     }
 
-    resDesc.res.array.array = output;
+    resDesc.res.array.array = reinterpret_cast<cudaArray_t>(output);
     err = cudaCreateSurfaceObject(&outputSurf, &resDesc);
     if (err != cudaSuccess) {
         cudaDestroySurfaceObject(inputSurf);
