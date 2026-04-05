@@ -55,6 +55,7 @@ NuGet dependencies: fmt, OpenXR.Headers, OpenXR.Loader, WIL (restore automatical
 - **VulkanFrameProcessor functional pipeline:** current dispatch path is infrastructure only; OFA → stereo adaptation → pre-warp → synthesis → hole-fill still needs live wiring.
 - **Timing semantics validation:** keep single-submit rewrite as baseline; dual-submit remains gated/experimental until runtime compliance is proven.
 - **In-game validation pass:** verify Star Citizen runtime traces (`r_sterodepthcomposition=1`) show stable depth detection, synthesis readiness, active rewrite, and no fence starvation.
+- **Asynchronous Presentation**: To support variable frame rates (e.g., 60fps to 90Hz), submission must eventually be decoupled from the application's xrEndFrame calls. FrameBroker will need to buffer completed app frames, while a separate thread or timing mechanism synthesizes and submits frames based strictly on the runtime's display cadence, using fractional time scaling for the OFA vectors.
 
 **Architecture corrections (must follow):**
 - This project outputs an **OpenXR API layer DLL** referenced by manifest `library_path`; it must **not** be named/replaced as `openxr_loader.dll`.

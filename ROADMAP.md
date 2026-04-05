@@ -89,7 +89,7 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 
 ---
 
-## Phase 3 — Timing Semantics Validation (Single vs Dual Submit)
+## Phase 3 — Timing Semantics Validation (Decoupled Presentation & Asynchronous Submission.)
 
 **Objective:** Validate runtime-compliant pacing semantics before enabling any 45->90 behavior.
 
@@ -100,6 +100,7 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
    - synthesis completion timestamp
    - actual submission timestamp
 3. Prototype dual-submit behavior behind runtime flag **only after single-submit stability**.
+4. Implement a buffering strategy in FrameBroker to hold N past frames. Calculate fractional motion vector scaling based on Δt between the buffered frames and the target predictedDisplayTime.
 4. Validate runtime acceptance/compositor stability/frame pacing under that mode.
 
 ### Critical Note
