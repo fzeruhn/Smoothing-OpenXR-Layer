@@ -195,6 +195,7 @@ int main()
                     return x;
                 }
             }
+            printf("[WARN] No valid pixel found in region [%u, %u), using midpoint fallback\n", xBegin, xEnd);
             return (xBegin + xEnd) / 2;
         };
 
@@ -221,7 +222,15 @@ int main()
             printf("[PASS] Hole map has disocclusion regions\n");
         }
 
-        // Check 2: Foreground and background vectors should preserve horizontal motion
+        // Check 2: Stereo geometry invariant from disparity model
+        if (disparity_fg <= disparity_bg) {
+            printf("[FAIL] Expected foreground disparity (%.2f) > background disparity (%.2f)\n", disparity_fg, disparity_bg);
+            pass = false;
+        } else {
+            printf("[PASS] Foreground disparity is larger than background disparity\n");
+        }
+
+        // Check 3: Foreground and background vectors should preserve horizontal motion
         // (both should be close to original +512, 0 in S10.5)
         if (std::abs(vec_fg.x - MOTION_X) > 10 || std::abs(vec_fg.y - MOTION_Y) > 10) {
             printf("[FAIL] Foreground vector does not preserve motion\n");
@@ -235,6 +244,36 @@ int main()
             pass = false;
         } else {
             printf("[PASS] Background vector preserves motion\n");
+        }
+
+        // Check 4: Representative source pixels should land at disparity-shifted right-eye positions.
+        const int32_t src_fg_x = static_cast<int32_t>(W / 2) - 1; // in foreground half
+        const int32_t src_bg_x = static_cast<int32_t>(3 * W / 4); // in background half
+        const int32_t expected_fg_x = static_cast<int32_t>(std::round(static_cast<float>(src_fg_x) - disparity_fg));
+        const int32_t expected_bg_x = static_cast<int32_t>(std::round(static_cast<float>(src_bg_x) - disparity_bg));
+
+        bool geometrySampleOk = true;
+        auto checkMappedSample = [&](const char* label, int32_t expectedX) {
+            if (expectedX < 0 || expectedX >= static_cast<int32_t>(W)) {
+                printf("[FAIL] %s expected mapped x=%d is out of bounds\n", label, expectedX);
+                geometrySampleOk = false;
+                return;
+            }
+
+            const uint32_t idx = sampleY * W + static_cast<uint32_t>(expectedX);
+            const float2 mapped = h_rightVectors[idx];
+            if (h_holeMap[idx] != 0 || std::abs(mapped.x - MOTION_X) > 10 || std::abs(mapped.y - MOTION_Y) > 10) {
+                printf("[FAIL] %s mapped sample at x=%d did not contain expected motion\n", label, expectedX);
+                geometrySampleOk = false;
+            }
+        };
+
+        checkMappedSample("Foreground", expected_fg_x);
+        checkMappedSample("Background", expected_bg_x);
+        if (!geometrySampleOk) {
+            pass = false;
+        } else {
+            printf("[PASS] Representative pixels map to expected right-eye positions\n");
         }
 
         // -----------------------------------------------------------------------

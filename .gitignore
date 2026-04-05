@@ -12,5 +12,4 @@ docs/superpowers
 *.png
 
 # Test output artifacts
-ofa-test-output.png
 interop-test-output.*

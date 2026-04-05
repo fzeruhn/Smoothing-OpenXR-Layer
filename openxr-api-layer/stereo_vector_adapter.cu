@@ -140,14 +140,19 @@ __global__ void kernel_scatter_vectors(
         }
     }
 
-    // If depth test passed, write the motion vector
+    // If depth test passed, write the motion vector.
+    // Note: depth update (atomicCAS) and vector write are not a single atomic transaction.
+    // A later, closer writer may update depth and vector after this thread wins CAS, and this
+    // thread can still perform its vector store afterward. This is a known scatter-write tradeoff
+    // (also present in frame synthesis path) and may cause edge artifacts around disocclusions.
     if (written) {
         rightVectors[idx_R] = leftVectors[idx_L];
     }
 }
 
 // CUDA kernel: Mark holes in the right-eye vector field.
-// A pixel is a hole if it has zero depth (no data was scattered to it).
+// A pixel is marked as a hole if it has zero depth (no data was scattered to it).
+// This is a coverage/no-scatter map, not a full right-eye disocclusion classification.
 //
 // @param rightDepthBuffer: Right-eye depth buffer after scatter (float, width×height)
 // @param holeMap: Output hole map (uint8_t, width×height, 0=valid, 1=hole)

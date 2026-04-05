@@ -52,7 +52,8 @@ public:
     //                    reserved for future depth-consistency/occlusion logic; currently unused.
     // @return: tuple of (rightVectors, holeMap)
     //   - rightVectors: GPU buffer of adapted right-eye motion vectors (float2, width×height)
-    //   - holeMap: GPU buffer marking disocclusion regions (uint8_t, width×height, 0=valid, 1=hole)
+    //   - holeMap: GPU buffer marking no-scatter coverage gaps (uint8_t, width×height, 0=covered, 1=uncovered)
+    //              This is not a full disocclusion map yet; future revisions will incorporate rightDepth.
     // Note: Outputs are owned by StereoVectorAdapter and reused across calls; do not free.
     struct AdaptResult {
         float2* rightVectors;

@@ -37,8 +37,6 @@
 #include <openxr/openxr_platform.h>
 #include <map>       // For tracking image indices
 
-#include "stereo_vector_adapter.h"
-#include "utils/general.h"
 
 namespace openxr_api_layer {
 
@@ -280,7 +278,14 @@ namespace openxr_api_layer {
                     // Save this swapchain handle so we know to track its images
                     m_colorSwapchains.push_back(*swapchain);
 
-                    // Store swapchain resolution
+                    // Store swapchain resolution for future stereo-adapter wiring.
+                    if (m_swapchainWidth != 0 && m_swapchainHeight != 0 &&
+                        (m_swapchainWidth != createInfo->width || m_swapchainHeight != createInfo->height)) {
+                        Log(fmt::format("[WARN] Color swapchain resolution changed from {}x{} to {}x{}; "
+                            "future stereo adaptation must use per-swapchain dimensions\n",
+                            m_swapchainWidth, m_swapchainHeight, createInfo->width, createInfo->height));
+                    }
+
                     m_swapchainWidth = createInfo->width;
                     m_swapchainHeight = createInfo->height;
 
@@ -398,8 +403,9 @@ namespace openxr_api_layer {
                     m_processor->ProcessFrames(currentColor, currentDepth, m_prevColor, m_prevDepth);
                 }
 
-                // TODO: When OFA pipeline is integrated, call m_stereoAdapter->adapt() here
-                // to derive right-eye vectors from left-eye OFA output
+                // TODO: When OFA pipeline is integrated, invoke stereo vector adaptation here.
+                // Note: current StereoVectorAdapter::adapt() performs cudaDeviceSynchronize();
+                // hot-path integration should use a stream-based API to avoid CPU blocking.
 
                 // 4. Update our history buffers for the NEXT frame (t-1)
                 m_prevColor = currentColor;
@@ -442,7 +448,7 @@ namespace openxr_api_layer {
         XrFovf m_fovRight{};
         bool m_fovInitialized{false};
 
-        // Swapchain resolution (for stereo adapter initialization)
+        // Swapchain resolution (for future stereo adapter initialization)
         uint32_t m_swapchainWidth{0};
         uint32_t m_swapchainHeight{0};
 
