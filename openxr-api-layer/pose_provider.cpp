@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "pose_provider.h"
+#include "framework/dispatch.gen.h"
 
 namespace openxr_api_layer {
 
