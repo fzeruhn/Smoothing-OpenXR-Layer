@@ -29,7 +29,7 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 
 ---
 
-## Phase 0 — Stabilize Build + Runtime Baseline
+## Phase 0 — Stabilize Build + Runtime Baseline | Complete ✅
 
 **Objective:** Ensure reproducible “known-good” pass-through baseline before turning on rewrite/injection.
 
