@@ -53,14 +53,14 @@ namespace openxr_api_layer {
     using namespace log;
 
     // Vulkan result check for internal layer use (not to be confused with CHECK_XRCMD).
-    // Throws on failure so that constructor exceptions are visible and the layer doesn't
-    // silently proceed with a null command pool / buffer.
+    // Returns from the enclosing bool function on failure.
 #define CHECK_VK_LAYER(call) \
     do { \
         VkResult _vr = (call); \
-        if (_vr != VK_SUCCESS) \
-            throw std::runtime_error("Vulkan error " + std::to_string(static_cast<int>(_vr)) \
-                                     + " in " #call); \
+        if (_vr != VK_SUCCESS) { \
+            Log(fmt::format("[ERROR] Vulkan call failed: {} (VkResult={})\n", #call, static_cast<int>(_vr))); \
+            return false; \
+        } \
     } while (0)
 
     // Our API layer implement these extensions, and their specified version.
@@ -76,6 +76,33 @@ namespace openxr_api_layer {
 
         VulkanFrameProcessor(VkPhysicalDevice physicalDevice, VkDevice device, VkQueue queue, uint32_t queueFamilyIndex)
             : m_physicalDevice(physicalDevice), m_device(device), m_queue(queue) {
+            m_valid = Initialize(queueFamilyIndex);
+        }
+
+        bool IsValid() const {
+            return m_valid;
+        }
+
+        bool WaitForCopyCompletion() const {
+            if (!m_valid) {
+                Log("[ERROR] WaitForCopyCompletion called on invalid VulkanFrameProcessor.\n");
+                return false;
+            }
+            if (m_submitIndex == 0) {
+                return true;
+            }
+
+            const uint32_t lastSlot = (m_submitIndex - 1) % kCommandBufferRingSize;
+            const VkResult waitResult = vkWaitForFences(m_device, 1, &m_submitFences[lastSlot], VK_TRUE, UINT64_MAX);
+            if (waitResult != VK_SUCCESS) {
+                Log(fmt::format("[ERROR] Vulkan call failed: vkWaitForFences (VkResult={})\n", static_cast<int>(waitResult)));
+                return false;
+            }
+            return true;
+        }
+
+      private:
+        bool Initialize(uint32_t queueFamilyIndex) {
             // Create Command Pool for compute/graphics operations
             VkCommandPoolCreateInfo poolInfo{};
             poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -102,8 +129,10 @@ namespace openxr_api_layer {
 
             // TODO: Initialize your Vulkan Compute Pipeline here
             // (Create Descriptor Sets, Pipeline Layout, Compute Pipeline for Motion Vectors + Warp)
+            return true;
         }
 
+      public:
         ~VulkanFrameProcessor() {
             if (m_device) {
                 for (VkFence fence : m_submitFences) {
@@ -127,7 +156,8 @@ namespace openxr_api_layer {
                 return false;
             }
             if (fenceStatus != VK_SUCCESS) {
-                throw std::runtime_error("Vulkan error checking submit fence status");
+                Log(fmt::format("[ERROR] Vulkan call failed: vkGetFenceStatus (VkResult={})\n", static_cast<int>(fenceStatus)));
+                return false;
             }
 
             CHECK_VK_LAYER(vkResetFences(m_device, 1, &m_submitFences[slot]));
@@ -156,14 +186,18 @@ namespace openxr_api_layer {
             toTransfer[0].subresourceRange.layerCount = 1;
 
             toTransfer[1] = toTransfer[0];
-            toTransfer[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            toTransfer[1].srcAccessMask = 0;
             toTransfer[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            toTransfer[1].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            // The injection image has just been acquired for this frame and we overwrite it fully,
+            // so we can transition from UNDEFINED and discard any previous contents.
+            toTransfer[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             toTransfer[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toTransfer[1].image = targetColor;
 
+            // Source and target images have different producer stages:
+            // source may come from color attachment writes, while target starts from UNDEFINED.
             vkCmdPipelineBarrier(cmd,
-                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  0,
                                  0,
@@ -242,7 +276,8 @@ namespace openxr_api_layer {
                 return false;
             }
             if (fenceStatus != VK_SUCCESS) {
-                throw std::runtime_error("Vulkan error checking submit fence status");
+                Log(fmt::format("[ERROR] Vulkan call failed: vkGetFenceStatus (VkResult={})\n", static_cast<int>(fenceStatus)));
+                return false;
             }
 
             CHECK_VK_LAYER(vkResetFences(m_device, 1, &m_submitFences[slot]));
@@ -295,6 +330,7 @@ namespace openxr_api_layer {
         std::vector<VkCommandBuffer> m_commandBuffers;
         std::vector<VkFence> m_submitFences;
         uint32_t m_submitIndex{0};
+        bool m_valid{false};
         // TODO: Add VkPipeline, VkPipelineLayout, VkDescriptorSet etc.
     };
 
@@ -480,9 +516,14 @@ namespace openxr_api_layer {
                     if (!m_processor && m_vkDevice != VK_NULL_HANDLE) {
                         VkQueue queue;
                         vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &queue);
-                        m_processor = std::make_unique<VulkanFrameProcessor>(
+                        auto processor = std::make_unique<VulkanFrameProcessor>(
                             m_vkPhysicalDevice, m_vkDevice, queue, m_vkQueueFamilyIndex);
-                        Log("Vulkan Frame Processor Initialized!\n");
+                        if (processor->IsValid()) {
+                            m_processor = std::move(processor);
+                            Log("Vulkan Frame Processor Initialized!\n");
+                        } else {
+                            Log("[ERROR] Failed to initialize Vulkan Frame Processor.\n");
+                        }
                     }
 
                 // Get depth
@@ -685,9 +726,12 @@ namespace openxr_api_layer {
                                 haveInjectionImage = sourceColor != VK_NULL_HANDLE && injectionColor != VK_NULL_HANDLE &&
                                                      m_processor != nullptr &&
                                                      m_processor->CopyColorImage(sourceColor,
-                                                                               injectionColor,
-                                                                               m_frameBroker.GetSwapchainWidth(),
-                                                                               m_frameBroker.GetSwapchainHeight());
+                                                                                injectionColor,
+                                                                                m_frameBroker.GetSwapchainWidth(),
+                                                                                m_frameBroker.GetSwapchainHeight());
+                                if (haveInjectionImage) {
+                                    haveInjectionImage = m_processor->WaitForCopyCompletion();
+                                }
                             }
                         }
 

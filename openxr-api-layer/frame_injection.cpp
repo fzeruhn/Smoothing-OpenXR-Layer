@@ -24,7 +24,6 @@ void FrameInjection::EnsureSwapchain(OpenXrApi& api, XrSession session, const Fr
     XrSwapchainCreateInfo createInfo = *baseInfo;
     createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     createInfo.faceCount = 1;
-    createInfo.arraySize = 1;
     createInfo.mipCount = 1;
 
     XrSwapchain swapchain = XR_NULL_HANDLE;
