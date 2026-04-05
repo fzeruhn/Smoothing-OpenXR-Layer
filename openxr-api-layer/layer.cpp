@@ -84,7 +84,11 @@ namespace openxr_api_layer {
         }
 
         bool WaitForCopyCompletion() const {
-            if (!m_valid || m_submitIndex == 0) {
+            if (!m_valid) {
+                Log("[ERROR] WaitForCopyCompletion called on invalid VulkanFrameProcessor.\n");
+                return false;
+            }
+            if (m_submitIndex == 0) {
                 return true;
             }
 
@@ -184,10 +188,14 @@ namespace openxr_api_layer {
             toTransfer[1] = toTransfer[0];
             toTransfer[1].srcAccessMask = 0;
             toTransfer[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            // The injection image has just been acquired for this frame and we overwrite it fully,
+            // so we can transition from UNDEFINED and discard any previous contents.
             toTransfer[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             toTransfer[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toTransfer[1].image = targetColor;
 
+            // Source and target images have different producer stages:
+            // source may come from color attachment writes, while target starts from UNDEFINED.
             vkCmdPipelineBarrier(cmd,
                                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
