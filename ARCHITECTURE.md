@@ -142,14 +142,14 @@ Combine forward and backward warps weighted by confidence:
 
 **Purpose:** Fill pixels marked in the hole map that the warp could not reliably synthesize.
 
-**Algorithm (current):** Edge-directed interpolation — for each hole pixel, compute a weighted average from nearby valid pixels, with weights biased along detected edge orientation to avoid blurring across depth discontinuities.
+**Algorithm (current):** Hierarchical push-pull — a two-pass mipmap-based approach. The push phase downsamples the frame into a mipmap chain, ignoring pixels flagged in the hole map. The pull phase traverses back up the chain, blending lower-resolution valid colors exclusively into the hole pixels. This produces smooth, artifact-free fills with no sharp boundary discontinuities.
 
 **Interface:**
 ```
 fill(VkImage frame, VkImage hole_map) -> VkImage filled_frame
 ```
 
-**Design constraint:** This interface is intentionally stable. The math fill implementation can be replaced with an AI inpainting model (e.g., a small U-Net or diffusion inpainting) without modifying callers. The hole map drives both implementations identically.
+**Design constraint:** This interface is intentionally stable. The push-pull fill implementation can be replaced with an AI inpainting model (e.g., a small U-Net or diffusion inpainting) without modifying callers. The hole map drives both implementations identically.
 
 ---
 

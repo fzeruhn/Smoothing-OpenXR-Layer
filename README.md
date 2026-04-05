@@ -22,11 +22,11 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for full system design and [`ROADMAP.md
 | 1.5. OpenXR Data Pipeline | 🔄 Partial |
 | 2. 6DoF Pose Data Pipeline | ⏳ Pending |
 | 3. OFA Integration (NVOf SDK 5.0.7) | ✅ Complete |
-| 4. Pre-OFA Pose Pre-warp | ⏳ Pending |
+| 4. Pre-OFA Pose Pre-warp | 🔄 Infrastructure Complete |
 | 5. Depth Acquisition | ⏳ Pending |
 | 6. LSR Fallback | ⏳ Pending |
 | 7. Bidirectional Frame Synthesis | ✅ Complete |
-| 8. Stereo Vector Adaptation | ⏳ Pending |
+| 8. Stereo Vector Adaptation | ✅ Complete |
 | 9. Hole Filling (Push-Pull) | ✅ Complete |
 | 10. Frame Submission | ⏳ Pending |
 | 11. Dynamic Frame Rate Targeting | ⏳ Pending |
@@ -86,7 +86,7 @@ copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64\cudart64_
 
 ## Standalone Tests
 
-Four headless test executables validate the completed pipeline subsystems. Run them from the solution root:
+Six headless test executables validate the completed pipeline subsystems. Run them from the solution root:
 
 | Test | What it validates |
 |---|---|
@@ -94,6 +94,8 @@ Four headless test executables validate the completed pipeline subsystems. Run t
 | `bin\x64\Debug\ofa-test.exe` | OFA optical flow end-to-end: random-noise frames with a known pixel shift |
 | `bin\x64\Debug\synthesis-test.exe` | Bidirectional frame synthesis: checkerboard translation |
 | `bin\x64\Debug\hole-fill-test.exe` | Push-pull hole filling: solid and gradient frames with synthetic holes |
+| `bin\x64\Debug\pose-warp-test.exe` | Pose warp: checkerboard + 5° yaw rotation, pixel change in central ROI |
+| `bin\x64\Debug\stereo-adapter-test.exe` | Stereo vector adaptation: depth-layered scene, disparity ordering and hole detection |
 
 `ofa-test.exe` also writes `ofa-test-output.png` (color-coded flow field, red=X, green=Y, ±16px range) to the current directory.
 
@@ -126,7 +128,11 @@ openxr-api-layer/
   layer.cpp                    Main layer logic — OpenXR hooks live here
   layer.h                      Layer class definition
   vulkan_cuda_interop.h/.cpp   SharedImage + SharedSemaphore RAII wrappers (Item 1)
+  ofa_pipeline.h/.cpp          OFAPipeline RAII + NvOF 5.0.7 integration (Item 3)
+  pose_warp_math.h/.cpp        Homography computation from quaternion + FOV (Item 4)
+  pose_warp.h/.cu              PoseWarper RAII + CUDA backward warp kernel (Item 4)
   frame_synthesizer.h/.cu      FrameSynthesizer RAII + CUDA kernels (Item 7)
+  stereo_vector_adapter.h/.cu  StereoVectorAdapter RAII + depth-based adaptation (Item 8)
   hole_filler.h/.cu            HoleFiller push-pull CUDA kernel (Item 9)
   pch.h / pch.cpp              Precompiled headers
   framework/
@@ -147,6 +153,10 @@ synthesis-test/
   main.cpp                     Bidirectional synthesis end-to-end test
 hole-fill-test/
   main.cpp                     Push-pull hole fill end-to-end test
+pose-warp-test/
+  main.cpp                     Pose warp test: checkerboard + 5° yaw rotation
+stereo-adapter-test/
+  main.cpp                     Stereo vector adaptation test: depth-layered scene validation
 external/
   OpenXR-SDK/                  Khronos OpenXR SDK (submodule)
   OpenXR-SDK-Source/           Khronos OpenXR SDK source (submodule)
