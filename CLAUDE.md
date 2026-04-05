@@ -68,12 +68,23 @@ Dependencies managed via NuGet (OpenXR headers/loader, fmt, WIL). CUDA and NVOf 
 - Validated end-to-end by `pose-warp-test`: 256×256 checkerboard + 5° yaw rotation, >20% pixel change in central ROI → **[PASS]**
 - Layer integration: TODO comments in `layer.cpp` mark where pose extraction and pre-warp will be inserted when Item 2 (Pose Data Pipeline) is complete. **Integration blocked on Item 2.**
 
+**Implemented (stereo_vector_adapter — Roadmap Item 8 complete):**
+- `StereoVectorAdapter` — RAII class; depth-tested atomic scatter kernel derives right-eye motion vectors from left-eye OFA output
+- Uses binocular disparity from the depth map and focal length from camera intrinsics (FOV) to shift left-eye vectors to the right eye
+- Produces a right-eye hole map marking disoccluded regions
+- Validated end-to-end by `stereo-adapter-test`: synthetic depth-layered scene (+16px horizontal motion), foreground disparity > background disparity, hole map non-empty → **[PASS]**
+
+**Implemented (hole_filler — Roadmap Item 9 complete):**
+- `HoleFiller` — RAII push-pull hole filler; modifies synthesized frame in-place
+- Four-stage CUDA pipeline: copy_level0 → push (N downsample levels) → pull (N upsample levels) → writeback
+- Stable `fill(frame, holeMap)` interface; AI inpainting can be swapped in without changing callers
+- Validated end-to-end by `hole-fill-test`: solid-red frame with 64-wide hole (16384/16384 within ±5) and blue/green split with 32-wide hole (8192/8192 within ±25) → **[PASS]**
+
 **Not yet implemented (stubs/TODOs):**
 - Vulkan compute pipeline in VulkanFrameProcessor
 - 6DoF pose capture and usage (pre-warp, LSR) — Roadmap Item 2 **[BLOCKS Item 4 integration]**
 - Depth acquisition (XR_KHR_composition_layer_depth or alternative) — Roadmap Item 5
 - Frame injection back to compositor via modified `xrEndFrame` — Roadmap Item 10
-- Hole filling (edge-directed interpolation) — Roadmap Item 9
 
 **OFA Pipeline: Deferred Optimizations (Future Items 4+)**
 
@@ -131,20 +142,6 @@ hole-fill-test/
 pose-warp-test/
   main.cpp                     Pose warp test: checkerboard + 5° yaw rotation, pixel change validation
   pose-warp-test.vcxproj       Standalone console app; uses CUDA 13.2 build customizations
-external/
-  OpenXR-SDK/                  Khronos OpenXR SDK (submodule)
-  OpenXR-SDK-Source/           Khronos OpenXR SDK source (submodule)
-  OpenXR-MixedReality/         Microsoft OpenXR MixedReality (submodule)
-  PVR/                         Pimax SDK, to be used for better eye tracking data
-scripts/
-  Install-Layer.ps1            Registers the layer in the Windows registry
-  Uninstall-Layer.ps1          Unregisters the layer
-  Tracing.wprp                 WPR trace capture profile
-```
-  ofa-test.vcxproj             Standalone console app; uses CUDA 13.2 build customizations
-synthesis-test/
-  main.cpp                     Bidirectional synthesis end-to-end test: checkerboard +16/+8 shift, validation
-  synthesis-test.vcxproj       Standalone console app; uses CUDA 13.2 build customizations
 external/
   OpenXR-SDK/                  Khronos OpenXR SDK (submodule)
   OpenXR-SDK-Source/           Khronos OpenXR SDK source (submodule)
@@ -215,14 +212,18 @@ powershell.exe -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Communit
 Both test exes live in `bin\x64\Debug\` (or `Release\`) and are run directly from the solution root:
 
 ```
-bin\x64\Debug\interop-test.exe   # Vulkan/CUDA interop round-trip
-bin\x64\Debug\ofa-test.exe       # OFA optical flow end-to-end
+bin\x64\Debug\interop-test.exe        # Vulkan/CUDA interop round-trip
+bin\x64\Debug\ofa-test.exe            # OFA optical flow end-to-end
+bin\x64\Debug\synthesis-test.exe      # Bidirectional frame synthesis
+bin\x64\Debug\hole-fill-test.exe      # Push-pull hole filling
+bin\x64\Debug\pose-warp-test.exe      # Pose-based homography warp
+bin\x64\Debug\stereo-adapter-test.exe # Stereo vector adaptation
 ```
 
 `ofa-test.exe` writes `ofa-test-output.png` to the current directory (color-coded flow field, red=X, green=Y, ±16px range).
 
 ### cudart64_13.dll
-Both test exes require `cudart64_13.dll` at runtime. The DLL is **not** in the default PATH — copy it manually after the first build:
+All test exes require `cudart64_13.dll` at runtime. The DLL is **not** in the default PATH — copy it manually after the first build:
 ```
 copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64\cudart64_13.dll" bin\x64\Debug\
 copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64\cudart64_13.dll" bin\x64\Release\
