@@ -35,19 +35,25 @@ NuGet dependencies: fmt, OpenXR.Headers, OpenXR.Loader, WIL (restore automatical
 ## Current Implementation Status
 
 **Implemented:**
-- **layer.cpp** — xrCreateSession, xrCreateSwapchain, xrEnumerateSwapchainImages, xrAcquireSwapchainImage, xrEndFrame (color/depth capture, async stub); VulkanFrameProcessor (command pool/buffer; compute pipeline stubbed)
+- **layer.cpp** — xrCreateSession, xrCreateSwapchain, xrEnumerateSwapchainImages, xrAcquireSwapchainImage, xrWaitFrame, xrEndFrame; delegates to modular frame/pose/depth helpers. Runtime behavior still pass-through at final submission.
 - **Item 1 — vulkan_cuda_interop** — `SharedImage` (VkImage↔CUarray) + `SharedSemaphore` (VkSemaphore↔CUexternalSemaphore). Validated by `interop-test` → **[PASS]**
 - **Item 3 — ofa_pipeline** — `OFAPipeline`: NvOF 5.0.7 dynamic load, loadFrame/execute. **NvOF FORWARD convention:** vectors give displacement inputFrame→referenceFrame (NOT reference→input). Validated by `ofa-test` → **[PASS]**
-- **Item 4 (infra) — pose_warp** — `PoseWarper` (backward CUDA warp) + `pose_warp_math` (homography from quaternion+FOV). Integration **blocked on Item 2**. Validated by `pose-warp-test` → **[PASS]**
+- **Item 2 / 1.5 foundation** — `FrameContext` + `PoseProvider`: caches predicted display time from `xrWaitFrame`, populates predicted views via `xrLocateViews`, records render-view FOV/pose from projection layers.
+- **Item 4 (infra) — pose_warp** — `PoseWarper` (backward CUDA warp) + `pose_warp_math` (homography from quaternion+FOV). Integration now has pose plumbing, but pre-warp is still not wired into live OFA path. Validated by `pose-warp-test` → **[PASS]**
+- **Item 5 foundation** — `DepthProvider`: parses `XR_KHR_composition_layer_depth` from projection view chains, resolves Vulkan depth image handles, surfaces metadata (`minDepth/maxDepth/nearZ/farZ/reversedZ`) with fallback to tracked depth swapchain.
 - **Item 7 — frame_synthesizer** — `FrameSynthesizer`: depth-sorted scatter + bilinear gather + 50/50 blend. **Reversed-Z note:** Star Citizen likely uses 1=near/0=far — invert depth in `kernel_scatter` if background occludes foreground. Validated by `synthesis-test` → **[PASS]**
 - **Item 8 — stereo_vector_adapter** — `StereoVectorAdapter`: derives right-eye vectors from left-eye OFA via binocular disparity + depth. Validated by `stereo-adapter-test` → **[PASS]**
 - **Item 9 — hole_filler** — `HoleFiller`: push-pull mipmap fill in-place; stable `fill(frame, holeMap)` interface (AI inpainting slot). Validated by `hole-fill-test` → **[PASS]**
+- **Frame transport extraction** — `FrameBroker`: centralized swapchain registration, image mapping, acquired-index tracking, and current color/depth retrieval.
+- **Injection scaffolding** — `FrameInjection`: creates dedicated synthetic color swapchain and exposes readiness; recursion guard added for internal swapchain creation.
+- **Vulkan submission safety hardening** — `VulkanFrameProcessor` migrated from single command buffer to command-buffer ring + per-slot fence gating to avoid CPU/GPU re-record races.
 
 **Pending (stubs/TODOs):**
-- Item 2: 6DoF pose capture — **blocks Item 4 integration**
-- Item 5: Depth acquisition (`XR_KHR_composition_layer_depth` or fallback)
-- Item 10: Frame injection into downstream `xrEndFrame`
-- VulkanFrameProcessor compute pipeline
+- **Item 2 integration remainder:** compute and use `pose_delta = display_pose * inverse(render_pose)` in live pre-warp path.
+- **Item 5 integration remainder:** apply depth convention policy in synthesis path (reversed-Z + near/far handling validation in-game).
+- **Item 10 remainder (major blocker for in-game FG):** write synthesized output into injection swapchain images and rewrite downstream projection-layer subimages in `xrEndFrame`.
+- **VulkanFrameProcessor functional pipeline:** current dispatch path is infrastructure only; OFA → stereo adaptation → pre-warp → synthesis → hole-fill still needs live wiring.
+- **In-game validation pass:** verify Star Citizen runtime traces (`r_sterodepthcomposition=1`) show stable depth detection, synthesis readiness, and active frame injection.
 
 **OFA deferred optimizations (for live integration):** switch to `cuMemcpy2DAsync` (async copies); add `hostPitch` to `loadFrame()` (Vulkan stride); bypass `loadFrame()` entirely via CUDA/Vulkan interop to keep frames GPU-resident.
 
@@ -58,6 +64,11 @@ NuGet dependencies: fmt, OpenXR.Headers, OpenXR.Loader, WIL (restore automatical
 ```
 openxr-api-layer/
   layer.cpp / layer.h              Main OpenXR hooks
+  frame_context.h                  Per-frame pose/depth/render context
+  pose_provider.h/.cpp             Predicted view/pose capture (xrWaitFrame + xrLocateViews)
+  depth_provider.h/.cpp            XR_KHR_composition_layer_depth parsing + depth metadata
+  frame_broker.h/.cpp              Swapchain/image/index tracking for frame transport
+  frame_injection.h/.cpp           Synthetic swapchain allocation + injection readiness state
   vulkan_cuda_interop.h/.cpp       SharedImage + SharedSemaphore (Item 1)
   ofa_pipeline.h/.cpp              OFAPipeline + NvOF 5.0.7 (Item 3)
   pose_warp_math.h/.cpp            Homography from quaternion+FOV (Item 4)

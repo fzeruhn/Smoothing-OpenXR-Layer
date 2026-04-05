@@ -21,17 +21,26 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 1.5. OpenXR Data Pipeline - Partially complete
+## 1.5. OpenXR Data Pipeline ✅ PARTIALLY COMPLETE
 
 **Goal:** Get all informarion that will be needed for later calculations from openxr, and do any nessecary calculations to make it usable
 
 **Work:**
 - Hook OpenXR (xrLocateViews) to extract the headset's physical FOV (parsing XrFovf to account for asymmetric/canted displays).
-- TODO: fill out
+- Introduce centralized per-frame context object for pose/depth/render inputs.
+- Track swapchain/image/index state in a dedicated frame transport module.
+
+**Delivered:**
+- `openxr-api-layer/frame_context.h` — per-frame render views, predicted views, depth metadata.
+- `openxr-api-layer/frame_broker.h/.cpp` — swapchain registration, Vulkan image mapping, acquire-index tracking.
+- `layer.cpp` now uses delegated frame transport and context assembly instead of ad-hoc state.
+
+**Remaining for 1.5:**
+- Wire frame broker to injection submit path (currently readiness/scaffolding only).
 
 ---
 
-## 2. 6DoF Pose Data Pipeline
+## 2. 6DoF Pose Data Pipeline - Partially complete
 
 **Goal:** Reliably capture render-time pose and display-time pose at each `xrEndFrame`, and make them available to downstream systems.
 
@@ -41,6 +50,18 @@ Each item is listed in dependency order. Complete earlier items before starting 
 - Define `PoseData` struct: `{ render_pose, display_pose, predicted_display_time, frame_index }`
 - Compute `pose_delta = display_pose * inverse(render_pose)` — this is the input to pre-warp and LSR
 - Store per-frame pose history (ring buffer, at least 2 frames deep)
+
+**Delivered so far:**
+- `openxr-api-layer/pose_provider.h/.cpp`
+  - caches predicted display time from `xrWaitFrame`
+  - calls `xrLocateViews` and stores predicted per-eye pose/FOV in `FrameContext`
+- `layer.cpp`
+  - captures render-time per-eye pose/FOV from projection layer views
+  - records both render and predicted views into `FrameContext`
+
+**Remaining:**
+- Compute explicit pose delta and feed it into live pre-warp path (Item 4 integration).
+- Add ring-buffered pose history for reprojection/fallback use.
 
 **Why second:** Pre-warp (item 4), LSR (item 6), and frame submission timing all depend on this. Design the struct now so downstream systems can be written against it.
 
@@ -83,7 +104,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 5. Depth Acquisition
+## 5. Depth Acquisition - Partially complete
 
 **Goal:** Obtain per-pixel depth data for both eyes at every frame.
 
@@ -95,6 +116,18 @@ Each item is listed in dependency order. Complete earlier items before starting 
 - Option C: Game-specific injection hook (last resort, fragile)
 
 **Deliverable:** Working depth acquisition for at least one path. Document which path is in use and its limitations.
+
+**Delivered so far:**
+- `openxr-api-layer/depth_provider.h/.cpp`
+  - parses `XrCompositionLayerDepthInfoKHR` chained to projection views
+  - resolves depth swapchain + image index to Vulkan `VkImage`
+  - surfaces metadata (`minDepth`, `maxDepth`, `nearZ`, `farZ`, `reversedZ`)
+- `layer.cpp`
+  - prefers depth from projection-layer depth chain, falls back to tracked depth swapchain
+  - emits depth metadata traces for runtime validation
+
+**Remaining:**
+- Validate Star Citizen depth conventions in runtime traces and apply final depth linearization policy in synthesis path.
 
 **Why fifth:** Depth-guided warping (item 7) and LSR 6DoF correction (item 6) both require depth. Establish the source before building the consumers.
 
@@ -168,7 +201,7 @@ Each item is listed in dependency order. Complete earlier items before starting 
 
 ---
 
-## 10. Frame Submission
+## 10. Frame Submission - In progress (scaffolding complete)
 
 **Goal:** Inject synthesized frame(s) back into the OpenXR compositor by modifying the downstream `xrEndFrame` call.
 
@@ -180,7 +213,35 @@ Each item is listed in dependency order. Complete earlier items before starting 
 - Handle image layout transitions to `XR_SWAPCHAIN_IMAGE_LAYOUT_COLOR_OPTIMAL` before submission
 - If possible, submit the frame along with its calculated depth to allow the runtime to perform its own reprojection
 
+**Delivered so far:**
+- `openxr-api-layer/frame_injection.h/.cpp`
+  - allocates a dedicated synthetic output swapchain from captured color swapchain create info
+  - recursion guard for internal swapchain creation path
+- `layer.cpp`
+  - tracks synthesis-ready state and injection-swapchain-ready state via tracing
+  - keeps submission behavior pass-through until safe image write + layer rewrite is complete
+- `VulkanFrameProcessor`
+  - command buffer ring + per-slot fences replace unsafe single-buffer reuse
+
+**Remaining (blockers):**
+- Acquire/write/release synthetic swapchain images with real synthesized output.
+- Build rewritten downstream `XrFrameEndInfo`/projection views that reference synthetic swapchain images.
+- Validate submission timing semantics (single submit vs dual submit strategy) against runtime behavior.
+
 **Why tenth:** Frame submission requires all upstream pipeline stages to produce valid output. Integrate last, after synthesis quality is validated offline.
+
+---
+
+## Current Critical Path to In-Game Test
+
+1. Finish live GPU stage wiring in `VulkanFrameProcessor` (OFA → stereo adaptation → pose pre-warp → synthesis → hole fill).
+2. Complete Item 10 image write + projection-layer swapchain rewrite.
+3. Validate depth convention and pose-delta usage in runtime traces.
+4. Run in Star Citizen with `r_sterodepthcomposition=1` and verify:
+   - depth chain present and stable
+   - synthesis path active
+   - injection path active
+   - no fence starvation / no CPU stalls in `xrEndFrame`.
 
 ---
 
