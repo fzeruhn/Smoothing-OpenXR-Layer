@@ -25,6 +25,9 @@
 
 #include "pch.h"
 #include "layer.h"
+#include "depth_provider.h"
+#include "frame_context.h"
+#include "pose_provider.h"
 #include <log.h>
 #include <util.h>
 #include <algorithm>
@@ -150,7 +153,9 @@ namespace openxr_api_layer {
     // This class implements our API layer.
     class OpenXrLayer : public openxr_api_layer::OpenXrApi {
       public:
-        OpenXrLayer() = default;
+        OpenXrLayer() {
+            m_depthProvider.SetSwapchainImageLookup(&m_vulkanImages, &m_acquiredIndices);
+        }
         ~OpenXrLayer() = default;
 
         // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetInstanceProcAddr
@@ -365,21 +370,37 @@ namespace openxr_api_layer {
             return result;
         }
 
+        XrResult xrWaitFrame(XrSession session, const XrFrameWaitInfo* frameWaitInfo, XrFrameState* frameState) override {
+            XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            if (XR_SUCCEEDED(result) && session == m_session && frameState && frameState->type == XR_TYPE_FRAME_STATE) {
+                m_poseProvider.OnWaitFrame(*frameState);
+            }
+            return result;
+        }
+
         // 4. HOOK END FRAME (The trigger to copy the data)
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             if (session == m_session && m_apiType == GraphicsAPI::Vulkan) {
+                m_frameContext = FrameContext{};
+                const XrCompositionLayerProjection* projectionLayer = nullptr;
+
                 // Extract per-eye FOV from projection layers
                 if (frameEndInfo && frameEndInfo->layerCount > 0) {
                     for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
                         const XrCompositionLayerBaseHeader* layer = frameEndInfo->layers[i];
                         if (layer && layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-                            const XrCompositionLayerProjection* projLayer =
+                            projectionLayer =
                                 reinterpret_cast<const XrCompositionLayerProjection*>(layer);
                             
                             // Extract FOV from both eyes
-                            if (projLayer->viewCount >= 2) {
-                                m_fovLeft = projLayer->views[0].fov;
-                                m_fovRight = projLayer->views[1].fov;
+                            if (projectionLayer->viewCount >= 2) {
+                                m_fovLeft = projectionLayer->views[0].fov;
+                                m_fovRight = projectionLayer->views[1].fov;
+                                for (uint32_t eye = 0; eye < 2; ++eye) {
+                                    m_frameContext.renderViews[eye].fov = projectionLayer->views[eye].fov;
+                                    m_frameContext.renderViews[eye].pose = projectionLayer->views[eye].pose;
+                                    m_frameContext.renderViews[eye].valid = true;
+                                }
                                 
                                 if (!m_fovInitialized) {
                                     m_fovInitialized = true;
@@ -403,6 +424,23 @@ namespace openxr_api_layer {
                     }
                 }
 
+                if (projectionLayer) {
+                    const XrResult poseResult =
+                        m_poseProvider.PopulatePredictedViews(*this, session, *projectionLayer, m_frameContext);
+                    if (XR_FAILED(poseResult)) {
+                        TraceLoggingWrite(g_traceProvider,
+                                          "PoseProvider_Failed",
+                                          TLArg(xr::ToCString(poseResult), "Result"));
+                    }
+
+                    m_depthProvider.ExtractDepthInfo(*projectionLayer, m_frameContext);
+                    const bool hasDepthChain = m_frameContext.depthViews[0].valid || m_frameContext.depthViews[1].valid;
+                    if (!hasDepthChain && !m_depthWarningLogged) {
+                        m_depthWarningLogged = true;
+                        Log("[WARN] No XR_KHR_composition_layer_depth info on projection views; using tracked depth swapchains.\n");
+                    }
+                }
+
                 VkImage currentColor = VK_NULL_HANDLE;
                 VkImage currentDepth = VK_NULL_HANDLE;
 
@@ -412,8 +450,12 @@ namespace openxr_api_layer {
                     currentColor = m_vulkanImages[colorChain][m_acquiredIndices[colorChain]];
                 }
 
-                // 2. Grab Current Depth
-                if (!m_depthSwapchains.empty()) {
+                // 2. Grab Current Depth (prefer depth chained on projection views)
+                if (m_frameContext.depthViews[0].valid) {
+                    currentDepth = m_frameContext.depthViews[0].image;
+                } else if (m_frameContext.depthViews[1].valid) {
+                    currentDepth = m_frameContext.depthViews[1].image;
+                } else if (!m_depthSwapchains.empty()) {
                     XrSwapchain depthChain = m_depthSwapchains[0];
                     currentDepth = m_vulkanImages[depthChain][m_acquiredIndices[depthChain]];
                 }
@@ -458,6 +500,10 @@ namespace openxr_api_layer {
         XrSession m_session{XR_NULL_HANDLE};
 
         std::unique_ptr<VulkanFrameProcessor> m_processor;
+        PoseProvider m_poseProvider;
+        DepthProvider m_depthProvider;
+        FrameContext m_frameContext{};
+        bool m_depthWarningLogged{false};
 
         // Vulkan Tracking
         VkInstance m_vkInstance{VK_NULL_HANDLE};

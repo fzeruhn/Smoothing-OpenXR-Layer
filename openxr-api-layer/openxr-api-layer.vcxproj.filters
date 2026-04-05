@@ -44,6 +44,15 @@
     <ClInclude Include="utils\inputs.h">
       <Filter>Utilities</Filter>
     </ClInclude>
+    <ClInclude Include="frame_context.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="pose_provider.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="depth_provider.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch.cpp">
@@ -78,6 +87,12 @@
     </ClCompile>
     <ClCompile Include="utils\general.cpp">
       <Filter>Utilities</Filter>
+    </ClCompile>
+    <ClCompile Include="pose_provider.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="depth_provider.cpp">
+      <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
