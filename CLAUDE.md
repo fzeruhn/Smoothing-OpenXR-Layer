@@ -53,7 +53,12 @@ NuGet dependencies: fmt, OpenXR.Headers, OpenXR.Loader, WIL (restore automatical
 - **Item 5 integration remainder:** apply depth convention policy in synthesis path (reversed-Z + near/far handling validation in-game).
 - **Item 10 remainder (major blocker for in-game FG):** write synthesized output into injection swapchain images and rewrite downstream projection-layer subimages in `xrEndFrame`.
 - **VulkanFrameProcessor functional pipeline:** current dispatch path is infrastructure only; OFA → stereo adaptation → pre-warp → synthesis → hole-fill still needs live wiring.
-- **In-game validation pass:** verify Star Citizen runtime traces (`r_sterodepthcomposition=1`) show stable depth detection, synthesis readiness, and active frame injection.
+- **Timing semantics validation:** keep single-submit rewrite as baseline; dual-submit remains gated/experimental until runtime compliance is proven.
+- **In-game validation pass:** verify Star Citizen runtime traces (`r_sterodepthcomposition=1`) show stable depth detection, synthesis readiness, active rewrite, and no fence starvation.
+
+**Architecture corrections (must follow):**
+- This project outputs an **OpenXR API layer DLL** referenced by manifest `library_path`; it must **not** be named/replaced as `openxr_loader.dll`.
+- Treat OpenXR pacing semantics as strict (`xrWaitFrame -> xrBeginFrame -> xrEndFrame`). Do not assume two independent compositor submissions can be attached to a single app-frame heartbeat without explicit runtime-safe behavior.
 
 **OFA deferred optimizations (for live integration):** switch to `cuMemcpy2DAsync` (async copies); add `hostPitch` to `loadFrame()` (Vulkan stride); bypass `loadFrame()` entirely via CUDA/Vulkan interop to keep frames GPU-resident.
 
