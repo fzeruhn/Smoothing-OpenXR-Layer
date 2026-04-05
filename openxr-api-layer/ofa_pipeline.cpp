@@ -111,10 +111,10 @@ OFAPipeline::OFAPipeline(CUcontext ctx,
         CHECK_NVOF(m_api.nvOFCreateGPUBufferCuda(m_hOf, &outputDesc,
                    NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &m_outputBuf));
     } catch (...) {
-#ifdef _WIN32
-        FreeLibrary(static_cast<HMODULE>(m_hModule));
-#endif
-        m_hModule = nullptr;
+        // Constructor didn't complete — destructor won't run. Release any
+        // OFA handles and the DLL that were acquired before the failure.
+        // destroy() is safe to call with partial state (checks each handle).
+        destroy();
         throw;
     }
 }
