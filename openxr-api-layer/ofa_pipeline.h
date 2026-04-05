@@ -110,6 +110,7 @@ public:
 private:
     void destroy() noexcept;
 
+    void*                        m_hModule{nullptr};  // HMODULE for nvofapi64.dll (opaque to avoid <windows.h> in header)
     NV_OF_CUDA_API_FUNCTION_LIST m_api{};
     NvOFHandle                   m_hOf{};
     NvOFGPUBufferHandle          m_inputBufs[2]{};

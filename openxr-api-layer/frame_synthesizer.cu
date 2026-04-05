@@ -41,10 +41,12 @@
 // File-local helpers — texture and surface object creation
 // ---------------------------------------------------------------------------
 
-// Create a bilinear-sampled texture object from an RGBA8 or R32F CUarray.
-// normalizedFloat=true  → uint8 input is mapped to [0.0, 1.0] float output.
-// normalizedFloat=false → element type is returned as-is (use for R32F depth).
-static CUtexObject makeTexObject(CUarray arr, bool normalizedFloat)
+// Create a bilinear-sampled texture object from a CUarray (RGBA8 or R32F).
+// For RGBA8: the hardware promotes uint8 channels to float [0,1] by default.
+// For R32F depth: raw float elements are returned as-is.
+// flags=0 is correct for both types — CU_TRSF_READ_AS_INTEGER is only defined
+// for integer-type arrays and must not be set on float arrays.
+static CUtexObject makeTexObject(CUarray arr)
 {
     CUDA_RESOURCE_DESC rd = {};
     rd.resType             = CU_RESOURCE_TYPE_ARRAY;
@@ -54,9 +56,7 @@ static CUtexObject makeTexObject(CUarray arr, bool normalizedFloat)
     td.addressMode[0] = CU_TR_ADDRESS_MODE_CLAMP;
     td.addressMode[1] = CU_TR_ADDRESS_MODE_CLAMP;
     td.filterMode     = CU_TR_FILTER_MODE_LINEAR;
-    // CU_TRSF_READ_AS_INTEGER suppresses normalisation and disables linear
-    // filtering — must be off for bilinear RGBA8 reads.
-    td.flags = normalizedFloat ? 0u : CU_TRSF_READ_AS_INTEGER;
+    td.flags          = 0u;
 
     CUtexObject tex = 0;
     CHECK_CU(cuTexObjectCreate(&tex, &rd, &td, nullptr));
@@ -103,7 +103,7 @@ __global__ void kernel_scatter(
     // Depth for this source pixel: smaller value = closer to camera.
     float depth;
     if (hasDepth) {
-        // tex2D with CU_TRSF_READ_AS_INTEGER=1 → raw float element
+        // R32F depth array — tex2D returns raw float element directly
         depth = tex2D<float>((cudaTextureObject_t)depthTex,
                              (float)sx + 0.5f, (float)sy + 0.5f);
     } else {
@@ -308,10 +308,10 @@ void FrameSynthesizer::execute(CUstream /*stream*/)
                         (size_t)m_width * m_height * sizeof(uint64_t)));
 
     // --- Create texture objects for input frames ---
-    CUtexObject texN  = makeTexObject(m_frameN,  true);   // RGBA8 normalised float
-    CUtexObject texN1 = makeTexObject(m_frameN1, true);
-    CUtexObject depthTexN  = m_depthN  ? makeTexObject(m_depthN,  false) : 0;
-    CUtexObject depthTexN1 = m_depthN1 ? makeTexObject(m_depthN1, false) : 0;
+    CUtexObject texN  = makeTexObject(m_frameN);   // RGBA8
+    CUtexObject texN1 = makeTexObject(m_frameN1);
+    CUtexObject depthTexN  = m_depthN  ? makeTexObject(m_depthN)  : 0;  // R32F depth
+    CUtexObject depthTexN1 = m_depthN1 ? makeTexObject(m_depthN1) : 0;
 
     // --- Create surface objects for outputs ---
     CUsurfObject surfOut  = makeSurfObject(m_outFrame);

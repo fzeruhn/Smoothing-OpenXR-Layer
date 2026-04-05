@@ -28,7 +28,7 @@ class PoseWarper {
     PoseWarper& operator=(PoseWarper&&) noexcept;
 
     // Apply homography warp to input image
-    // 
+    //
     // Parameters:
     //   input: Source CUarray (RGBA8 or similar format)
     //   output: Destination CUarray (same format as input)
@@ -40,6 +40,11 @@ class PoseWarper {
     // Warp type: Backward warp (iterate output pixels, sample input via inverse homography)
     // Sampling: Bilinear interpolation for sub-pixel accuracy
     // Out-of-bounds: Pixels outside input image are set to black (0,0,0,0)
+    //
+    // IMPORTANT: warp() enqueues the kernel asynchronously and returns immediately.
+    // Kernel execution errors (e.g. invalid surface access) will NOT be surfaced here —
+    // they appear on the next synchronizing call. The caller must issue
+    // cuStreamSynchronize(stream) or cuCtxSynchronize() before reading output pixels.
     void warp(CUarray input, CUarray output,
               uint32_t width, uint32_t height,
               const float homography[9],

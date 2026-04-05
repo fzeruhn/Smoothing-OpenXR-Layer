@@ -22,6 +22,15 @@
 
 #include "stereo_vector_adapter.h"
 
+// NOTE: This file uses the CUDA runtime API (cudaMalloc, cudaFree, cudaMemset,
+// cudaDeviceSynchronize) while all other subsystems use the CUDA driver API
+// (cuMemAlloc, cuMemFree, cuCtxSynchronize).  This inconsistency is intentional
+// for the standalone test harness but must be resolved before live integration:
+//   - Replace cudaMalloc/cudaFree with cuMemAlloc/cuMemFree.
+//   - Replace cudaDeviceSynchronize() with per-stream cuStreamSynchronize().
+//   - Update CHECK_CUDA to check CUresult instead of cudaError_t.
+// TODO (Item 8 integration): migrate to driver API for consistency.
+
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <stdexcept>
@@ -145,6 +154,12 @@ __global__ void kernel_scatter_vectors(
     // A later, closer writer may update depth and vector after this thread wins CAS, and this
     // thread can still perform its vector store afterward. This is a known scatter-write tradeoff
     // (also present in frame synthesis path) and may cause edge artifacts around disocclusions.
+    //
+    // The motion vector value is copied unchanged from the left eye. This is correct: the vector
+    // represents temporal displacement (frame N → N+1) which is approximately equal for both eyes
+    // at normal IPDs (the lateral 6.5 cm offset does not change how scene points move over time).
+    // The adapter's job is only to place the vector at the spatially-correct right-eye pixel
+    // position (accounting for disparity), not to modify the temporal displacement value.
     if (written) {
         rightVectors[idx_R] = leftVectors[idx_L];
     }

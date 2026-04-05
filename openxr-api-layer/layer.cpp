@@ -46,6 +46,17 @@ namespace openxr_api_layer {
 
     using namespace log;
 
+    // Vulkan result check for internal layer use (not to be confused with CHECK_XRCMD).
+    // Throws on failure so that constructor exceptions are visible and the layer doesn't
+    // silently proceed with a null command pool / buffer.
+#define CHECK_VK_LAYER(call) \
+    do { \
+        VkResult _vr = (call); \
+        if (_vr != VK_SUCCESS) \
+            throw std::runtime_error("Vulkan error " + std::to_string(static_cast<int>(_vr)) \
+                                     + " in " #call); \
+    } while (0)
+
     // Our API layer implement these extensions, and their specified version.
     const std::vector<std::pair<std::string, uint32_t>> advertisedExtensions = {};
 
@@ -62,7 +73,7 @@ namespace openxr_api_layer {
             poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
             poolInfo.queueFamilyIndex = queueFamilyIndex;
             poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-            vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_commandPool);
+            CHECK_VK_LAYER(vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_commandPool));
 
             // Allocate Command Buffer
             VkCommandBufferAllocateInfo allocInfo{};
@@ -70,7 +81,7 @@ namespace openxr_api_layer {
             allocInfo.commandPool = m_commandPool;
             allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
             allocInfo.commandBufferCount = 1;
-            vkAllocateCommandBuffers(m_device, &allocInfo, &m_commandBuffer);
+            CHECK_VK_LAYER(vkAllocateCommandBuffers(m_device, &allocInfo, &m_commandBuffer));
 
             // TODO: Initialize your Vulkan Compute Pipeline here
             // (Create Descriptor Sets, Pipeline Layout, Compute Pipeline for Motion Vectors + Warp)
@@ -91,7 +102,7 @@ namespace openxr_api_layer {
             VkCommandBufferBeginInfo beginInfo{};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
+            CHECK_VK_LAYER(vkBeginCommandBuffer(m_commandBuffer, &beginInfo));
 
             // 1. Image Memory Barriers (Transition layouts to be readable by your compute shader)
             // ... (Insert vkCmdPipelineBarrier here to transition to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
@@ -110,15 +121,21 @@ namespace openxr_api_layer {
             // 5. Image Memory Barriers (Transition back to COLOR_ATTACHMENT_OPTIMAL for OpenXR)
             // ...
 
-            vkEndCommandBuffer(m_commandBuffer);
+            CHECK_VK_LAYER(vkEndCommandBuffer(m_commandBuffer));
 
             // Submit work to the GPU queue. We do NOT wait for it to finish here.
             // OpenXR / the VR runtime will handle synchronization via Vulkan semaphores/fences natively.
+            //
+            // TODO (Item 10 — Frame Submission): This stub reuses a single command buffer with no
+            // fence.  Once ProcessFrames() records real GPU work, submitting without a fence while
+            // the previous submit may still be in flight is a Vulkan validation error.  Replace with
+            // either: (a) per-frame fences + CPU wait before re-recording, or (b) a ring of N
+            // command buffers (N >= 2 for double-buffering) so the CPU never races the GPU.
             VkSubmitInfo submitInfo{};
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &m_commandBuffer;
-            vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+            CHECK_VK_LAYER(vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE));
         }
 
       private:
