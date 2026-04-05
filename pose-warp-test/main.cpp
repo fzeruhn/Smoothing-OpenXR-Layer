@@ -134,7 +134,7 @@ static VkDevice createVulkanDevice(VkInstance& instance, VkPhysicalDevice& physD
 int main() {
     printf("=== Pose Warp Test ===\n");
     printf("Input: %dx%d checkerboard\n", W, H);
-    printf("Transform: %.1f° yaw rotation\n", YAW_DEG);
+    printf("Transform: %.1f dg yaw rotation\n", YAW_DEG);
     printf("Validation: central ROI changed pixels >= %.1f%%\n\n", MIN_CHANGED_PERCENT);
 
     // -----------------------------------------------------------------------
