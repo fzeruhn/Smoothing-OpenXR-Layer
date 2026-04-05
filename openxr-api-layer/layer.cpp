@@ -37,6 +37,7 @@
 #include <openxr/openxr_platform.h>
 #include <map>       // For tracking image indices
 
+
 namespace openxr_api_layer {
 
     using namespace log;
@@ -277,6 +278,17 @@ namespace openxr_api_layer {
                     // Save this swapchain handle so we know to track its images
                     m_colorSwapchains.push_back(*swapchain);
 
+                    // Store swapchain resolution for future stereo-adapter wiring.
+                    if (m_swapchainWidth != 0 && m_swapchainHeight != 0 &&
+                        (m_swapchainWidth != createInfo->width || m_swapchainHeight != createInfo->height)) {
+                        Log(fmt::format("[WARN] Color swapchain resolution changed from {}x{} to {}x{}; "
+                            "future stereo adaptation must use per-swapchain dimensions\n",
+                            m_swapchainWidth, m_swapchainHeight, createInfo->width, createInfo->height));
+                    }
+
+                    m_swapchainWidth = createInfo->width;
+                    m_swapchainHeight = createInfo->height;
+
                     // Initialize the processor
                     if (!m_processor && m_vkDevice != VK_NULL_HANDLE) {
                         VkQueue queue;
@@ -335,6 +347,41 @@ namespace openxr_api_layer {
         // 4. HOOK END FRAME (The trigger to copy the data)
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             if (session == m_session && m_apiType == GraphicsAPI::Vulkan) {
+                // Extract per-eye FOV from projection layers
+                if (frameEndInfo && frameEndInfo->layerCount > 0) {
+                    for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
+                        const XrCompositionLayerBaseHeader* layer = frameEndInfo->layers[i];
+                        if (layer && layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                            const XrCompositionLayerProjection* projLayer =
+                                reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+                            
+                            // Extract FOV from both eyes
+                            if (projLayer->viewCount >= 2) {
+                                m_fovLeft = projLayer->views[0].fov;
+                                m_fovRight = projLayer->views[1].fov;
+                                
+                                if (!m_fovInitialized) {
+                                    m_fovInitialized = true;
+                                    TraceLoggingWrite(g_traceProvider,
+                                                      "FOV_Extracted",
+                                                      TLArg(m_fovLeft.angleLeft, "LeftEye_AngleLeft"),
+                                                      TLArg(m_fovLeft.angleRight, "LeftEye_AngleRight"),
+                                                      TLArg(m_fovLeft.angleUp, "LeftEye_AngleUp"),
+                                                      TLArg(m_fovLeft.angleDown, "LeftEye_AngleDown"),
+                                                      TLArg(m_fovRight.angleLeft, "RightEye_AngleLeft"),
+                                                      TLArg(m_fovRight.angleRight, "RightEye_AngleRight"),
+                                                      TLArg(m_fovRight.angleUp, "RightEye_AngleUp"),
+                                                      TLArg(m_fovRight.angleDown, "RightEye_AngleDown"));
+                                }
+
+                                // StereoVectorAdapter wiring is compiled in tests first.
+                                // Runtime integration into the layer remains pending.
+                            }
+                            break; // Only process first projection layer
+                        }
+                    }
+                }
+
                 VkImage currentColor = VK_NULL_HANDLE;
                 VkImage currentDepth = VK_NULL_HANDLE;
 
@@ -355,6 +402,10 @@ namespace openxr_api_layer {
                     // Dispatch to GPU. Do NOT wait for idle.
                     m_processor->ProcessFrames(currentColor, currentDepth, m_prevColor, m_prevDepth);
                 }
+
+                // TODO: When OFA pipeline is integrated, invoke stereo vector adaptation here.
+                // Note: current StereoVectorAdapter::adapt() performs cudaDeviceSynchronize();
+                // hot-path integration should use a stream-based API to avoid CPU blocking.
 
                 // 4. Update our history buffers for the NEXT frame (t-1)
                 m_prevColor = currentColor;
@@ -391,6 +442,21 @@ namespace openxr_api_layer {
         // NEW: History tracking for Frame Generation/Warping
         VkImage m_prevColor{VK_NULL_HANDLE};
         VkImage m_prevDepth{VK_NULL_HANDLE};
+
+        // Per-eye FOV data (extracted from xrEndFrame projection layers)
+        XrFovf m_fovLeft{};
+        XrFovf m_fovRight{};
+        bool m_fovInitialized{false};
+
+        // Swapchain resolution (for future stereo adapter initialization)
+        uint32_t m_swapchainWidth{0};
+        uint32_t m_swapchainHeight{0};
+
+        // Placeholder: near/far planes for depth linearization (TODO: extract from projection matrix)
+        // These are typical VR values; should be extracted from actual projection in future
+        static constexpr float NEAR_PLANE = 0.1f;
+        static constexpr float FAR_PLANE = 100.0f;
+        static constexpr float IPD = 0.063f; // 63mm typical; TODO: query from runtime API
     };
 
     // This method is required by the framework to instantiate your OpenXrApi implementation.

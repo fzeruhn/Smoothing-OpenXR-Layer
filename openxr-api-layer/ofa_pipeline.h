@@ -2,8 +2,18 @@
 
 // NvOF C API — do not include through pch.h
 #include <cuda.h>
+#if __has_include("nvOpticalFlowCuda.h") && __has_include("nvOpticalFlowCommon.h")
 #include "nvOpticalFlowCuda.h"
 #include "nvOpticalFlowCommon.h"
+#elif __has_include("../Optical_Flow_SDK_5.0.7/NvOFInterface/nvOpticalFlowCuda.h") && __has_include("../Optical_Flow_SDK_5.0.7/NvOFInterface/nvOpticalFlowCommon.h")
+#include "../Optical_Flow_SDK_5.0.7/NvOFInterface/nvOpticalFlowCuda.h"
+#include "../Optical_Flow_SDK_5.0.7/NvOFInterface/nvOpticalFlowCommon.h"
+#elif __has_include("../../Optical_Flow_SDK_5.0.7/NvOFInterface/nvOpticalFlowCuda.h") && __has_include("../../Optical_Flow_SDK_5.0.7/NvOFInterface/nvOpticalFlowCommon.h")
+#include "../../Optical_Flow_SDK_5.0.7/NvOFInterface/nvOpticalFlowCuda.h"
+#include "../../Optical_Flow_SDK_5.0.7/NvOFInterface/nvOpticalFlowCommon.h"
+#else
+#error "NvOF headers not found. Add NvOFInterface to include paths or place Optical_Flow_SDK_5.0.7 next to the repo."
+#endif
 
 #include <cstdint>
 #include <stdexcept>
