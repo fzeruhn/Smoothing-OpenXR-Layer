@@ -10,6 +10,7 @@ bin/
 .claude/worktrees/
 docs/superpowers
 *.png
+*.etl
 
 # Test output artifacts
 interop-test-output.*
