@@ -100,7 +100,9 @@ public:
     void execute(CUstream stream = nullptr, bool readbackToHost = true);
 
     // Pointer into the host-side readback buffer.
-    // Valid after a cuCtxSynchronize() following execute().
+    // Valid only when execute(..., readbackToHost=true) has been used and
+    // the work is synchronized. If readbackToHost=false, this buffer is not
+    // refreshed; use outputDevicePtr() for GPU consumers.
     // Each element is NV_OF_FLOW_VECTOR { int16_t flowx, flowy } in S10.5 fixed-point.
     // Divide by 32.0f to convert to pixel displacement.
     const NV_OF_FLOW_VECTOR* outputData() const { return m_hostOutput.data(); }

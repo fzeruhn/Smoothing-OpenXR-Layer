@@ -179,6 +179,43 @@ namespace openxr_api_layer {
         }
 
       private:
+        void ResetLivePipelineResources() {
+            if (m_grayCurrent != 0) {
+                cuMemFree(m_grayCurrent);
+                m_grayCurrent = 0;
+            }
+            if (m_grayPrevious != 0) {
+                cuMemFree(m_grayPrevious);
+                m_grayPrevious = 0;
+            }
+            m_holeFiller.reset();
+            m_frameSynthesizer.reset();
+            m_ofaPipeline.reset();
+            m_cudaToVk.reset();
+            m_vkToCuda.reset();
+            m_stageOutputColor.reset();
+            m_stagePreviousColor.reset();
+            m_stageCurrentColor.reset();
+            m_livePipelineReady = false;
+            m_pendingCudaOutput = false;
+            m_stageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            m_stagePreviousLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            m_stageOutputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        }
+
+        void ResetCudaContext() {
+            if (m_cuStream != nullptr) {
+                cuStreamDestroy(m_cuStream);
+                m_cuStream = nullptr;
+            }
+            if (m_cuContext != nullptr) {
+                cuCtxSetCurrent(nullptr);
+                cuDevicePrimaryCtxRelease(m_cuDevice);
+                m_cuContext = nullptr;
+            }
+            m_cudaContextReady = false;
+        }
+
         bool SelectCudaDeviceForVulkan() {
             VkPhysicalDeviceIDProperties idProps{};
             idProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
@@ -233,10 +270,12 @@ namespace openxr_api_layer {
             }
             if (cuCtxSetCurrent(m_cuContext) != CUDA_SUCCESS) {
                 m_lastPipelineFailureReason = "cuCtxSetCurrent failed";
+                ResetCudaContext();
                 return false;
             }
             if (cuStreamCreate(&m_cuStream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) {
                 m_lastPipelineFailureReason = "cuStreamCreate failed";
+                ResetCudaContext();
                 return false;
             }
 
@@ -258,27 +297,7 @@ namespace openxr_api_layer {
             }
 
             if (m_pipelineWidth != width || m_pipelineHeight != height) {
-                if (m_grayCurrent != 0) {
-                    cuMemFree(m_grayCurrent);
-                    m_grayCurrent = 0;
-                }
-                if (m_grayPrevious != 0) {
-                    cuMemFree(m_grayPrevious);
-                    m_grayPrevious = 0;
-                }
-                m_holeFiller.reset();
-                m_frameSynthesizer.reset();
-                m_ofaPipeline.reset();
-                m_cudaToVk.reset();
-                m_vkToCuda.reset();
-                m_stageOutputColor.reset();
-                m_stagePreviousColor.reset();
-                m_stageCurrentColor.reset();
-                m_livePipelineReady = false;
-                m_pendingCudaOutput = false;
-                m_stageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                m_stagePreviousLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                m_stageOutputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                ResetLivePipelineResources();
             }
 
             try {
@@ -301,10 +320,10 @@ namespace openxr_api_layer {
                 m_holeFiller = std::make_unique<HoleFiller>(m_cuContext, width, height);
 
                 if (cuMemAlloc(&m_grayCurrent, width * height) != CUDA_SUCCESS) {
-                    return false;
+                    throw std::runtime_error("cuMemAlloc failed for m_grayCurrent");
                 }
                 if (cuMemAlloc(&m_grayPrevious, width * height) != CUDA_SUCCESS) {
-                    return false;
+                    throw std::runtime_error("cuMemAlloc failed for m_grayPrevious");
                 }
 
                 m_pipelineWidth = width;
@@ -314,7 +333,7 @@ namespace openxr_api_layer {
                 m_lastPipelineFailureReason.clear();
                 return true;
             } catch (const std::exception& e) {
-                m_livePipelineReady = false;
+                ResetLivePipelineResources();
                 m_livePipelineInitFailed = true;
                 m_pipelineWidth = width;
                 m_pipelineHeight = height;
@@ -322,7 +341,7 @@ namespace openxr_api_layer {
                 Log(fmt::format("[ERROR] EnsureLivePipeline failed: {}\n", m_lastPipelineFailureReason));
                 return false;
             } catch (...) {
-                m_livePipelineReady = false;
+                ResetLivePipelineResources();
                 m_livePipelineInitFailed = true;
                 m_pipelineWidth = width;
                 m_pipelineHeight = height;
@@ -378,32 +397,8 @@ namespace openxr_api_layer {
                 // TODO: Destroy your compute pipelines here
             }
 
-            if (m_grayCurrent != 0) {
-                cuMemFree(m_grayCurrent);
-                m_grayCurrent = 0;
-            }
-            if (m_grayPrevious != 0) {
-                cuMemFree(m_grayPrevious);
-                m_grayPrevious = 0;
-            }
-
-            m_holeFiller.reset();
-            m_frameSynthesizer.reset();
-            m_ofaPipeline.reset();
-            m_cudaToVk.reset();
-            m_vkToCuda.reset();
-            m_stageOutputColor.reset();
-            m_stagePreviousColor.reset();
-            m_stageCurrentColor.reset();
-
-            if (m_cuStream != nullptr) {
-                cuStreamDestroy(m_cuStream);
-                m_cuStream = nullptr;
-            }
-            if (m_cuContext != nullptr) {
-                cuDevicePrimaryCtxRelease(m_cuDevice);
-                m_cuContext = nullptr;
-            }
+            ResetLivePipelineResources();
+            ResetCudaContext();
         }
 
         bool CopyColorImage(VkImage sourceColor, VkImage targetColor, uint32_t width, uint32_t height) {
@@ -746,6 +741,17 @@ namespace openxr_api_layer {
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &cmd;
+
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSemaphore waitSemaphore = VK_NULL_HANDLE;
+            if (m_pendingCudaOutput && m_cudaToVk) {
+                waitSemaphore = m_cudaToVk->vkSemaphore();
+                submitInfo.waitSemaphoreCount = 1;
+                submitInfo.pWaitSemaphores = &waitSemaphore;
+                submitInfo.pWaitDstStageMask = &waitStage;
+                m_pendingCudaOutput = false;
+            }
+
             VkSemaphore vkToCudaSemaphore = m_vkToCuda->vkSemaphore();
             submitInfo.signalSemaphoreCount = 1;
             submitInfo.pSignalSemaphores = &vkToCudaSemaphore;
