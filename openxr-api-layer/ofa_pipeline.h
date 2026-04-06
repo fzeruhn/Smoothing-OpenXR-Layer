@@ -91,18 +91,24 @@ public:
     //   void setInputDevicePtr(int slot, CUdeviceptr devPtr);
     // so the pre-warp kernel can write directly into OFA input buffers.
     void loadFrame(int slot, const void* hostGray8);
+    void loadFrameDevice(int slot, CUdeviceptr deviceGray8, size_t srcPitch, CUstream stream = nullptr);
 
-    // Submit OFA work asynchronously.
-    // `stream` is reserved for the Item-4 pre-warp integration; currently ignored
-    // (OFA uses its own internal stream). Caller must call cuCtxSynchronize() before
-    // reading outputData().
-    void execute(CUstream stream = nullptr);
+    // Submit OFA work.
+    // `stream` is reserved for future integration; currently ignored because NvOF
+    // manages execution internally.
+    // If readbackToHost=false, skips host readback so hot paths can remain GPU-only.
+    void execute(CUstream stream = nullptr, bool readbackToHost = true);
 
     // Pointer into the host-side readback buffer.
-    // Valid after a cuCtxSynchronize() following execute().
+    // Valid only when execute(..., readbackToHost=true) has been used and
+    // the work is synchronized. If readbackToHost=false, this buffer is not
+    // refreshed; use outputDevicePtr() for GPU consumers.
     // Each element is NV_OF_FLOW_VECTOR { int16_t flowx, flowy } in S10.5 fixed-point.
     // Divide by 32.0f to convert to pixel displacement.
     const NV_OF_FLOW_VECTOR* outputData() const { return m_hostOutput.data(); }
+
+    // Device pointer to OFA output vectors (NV_OF_FLOW_VECTOR / SHORT2 layout).
+    CUdeviceptr outputDevicePtr() const;
 
     uint32_t outputWidth()  const { return m_outW; }  // width  / gridSize
     uint32_t outputHeight() const { return m_outH; }  // height / gridSize

@@ -60,6 +60,8 @@ public:
         uint8_t* holeMap;
     };
     AdaptResult adapt(const float2* leftVectors, const float* leftDepth, const float* rightDepth);
+    AdaptResult adaptAsync(const float2* leftVectors, const float* leftDepth, const float* rightDepth, CUstream stream = nullptr,
+                           bool synchronize = false);
 
     // Accessors for internal buffers (for testing/debugging)
     float2* getRightVectors() const { return m_rightVectors; }

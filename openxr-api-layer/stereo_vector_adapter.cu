@@ -240,7 +240,18 @@ StereoVectorAdapter::AdaptResult StereoVectorAdapter::adapt(
     const float* leftDepth,
     const float* rightDepth
 ) {
+    return adaptAsync(leftVectors, leftDepth, rightDepth, nullptr, true);
+}
+
+StereoVectorAdapter::AdaptResult StereoVectorAdapter::adaptAsync(
+    const float2* leftVectors,
+    const float* leftDepth,
+    const float* rightDepth,
+    CUstream stream,
+    bool synchronize
+) {
     (void)rightDepth;
+    cudaStream_t rtStream = reinterpret_cast<cudaStream_t>(stream);
 
     const size_t numPixels = m_width * m_height;
     
@@ -248,14 +259,14 @@ StereoVectorAdapter::AdaptResult StereoVectorAdapter::adapt(
     // Right vectors: zero (no motion)
     // Right depth buffer: zero (far in reversed-Z, will be overwritten by scatter)
     // Hole map: will be filled by kernel_mark_holes
-    CHECK_CUDA(cudaMemset(m_rightVectors, 0, numPixels * sizeof(float2)));
-    CHECK_CUDA(cudaMemset(m_rightDepthBuffer, 0, numPixels * sizeof(float)));
+    CHECK_CUDA(cudaMemsetAsync(m_rightVectors, 0, numPixels * sizeof(float2), rtStream));
+    CHECK_CUDA(cudaMemsetAsync(m_rightDepthBuffer, 0, numPixels * sizeof(float), rtStream));
 
     // Launch scatter kernel
     dim3 blockSize(16, 16);
     dim3 gridSize((m_width + blockSize.x - 1) / blockSize.x, (m_height + blockSize.y - 1) / blockSize.y);
 
-    kernel_scatter_vectors<<<gridSize, blockSize>>>(
+    kernel_scatter_vectors<<<gridSize, blockSize, 0, rtStream>>>(
         leftVectors,
         leftDepth,
         m_rightVectors,
@@ -270,7 +281,7 @@ StereoVectorAdapter::AdaptResult StereoVectorAdapter::adapt(
     CHECK_CUDA(cudaGetLastError());
 
     // Launch hole marking kernel
-    kernel_mark_holes<<<gridSize, blockSize>>>(
+    kernel_mark_holes<<<gridSize, blockSize, 0, rtStream>>>(
         m_rightDepthBuffer,
         m_holeMap,
         m_width,
@@ -278,8 +289,9 @@ StereoVectorAdapter::AdaptResult StereoVectorAdapter::adapt(
     );
     CHECK_CUDA(cudaGetLastError());
 
-    // Synchronize to ensure kernels complete
-    CHECK_CUDA(cudaDeviceSynchronize());
+    if (synchronize) {
+        CHECK_CUDA(cudaStreamSynchronize(rtStream));
+    }
 
     return {m_rightVectors, m_holeMap};
 }

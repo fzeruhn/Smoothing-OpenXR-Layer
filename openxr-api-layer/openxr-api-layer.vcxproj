@@ -290,6 +290,7 @@ copy $(SolutionDir)\scripts\Uninstall-Layer32.ps1 $(OutDir)
     <ClInclude Include="frame_synthesizer.h" />
     <ClInclude Include="frame_context.h" />
     <ClInclude Include="frame_injection.h" />
+    <ClInclude Include="gpu_pipeline_kernels.h" />
     <ClInclude Include="hole_filler.h" />
     <ClInclude Include="layer.h" />
     <ClInclude Include="ofa_pipeline.h" />
@@ -350,6 +351,7 @@ copy $(SolutionDir)\scripts\Uninstall-Layer32.ps1 $(OutDir)
   </ItemGroup>
   <ItemGroup>
     <CudaCompile Include="frame_synthesizer.cu" />
+    <CudaCompile Include="gpu_pipeline_kernels.cu" />
     <CudaCompile Include="hole_filler.cu" />
     <CudaCompile Include="pose_warp.cu" />
     <CudaCompile Include="stereo_vector_adapter.cu" />
