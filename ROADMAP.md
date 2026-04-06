@@ -89,62 +89,91 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 
 ---
 
-## Phase 3 — Decoupled Runtime Pacing Architecture (Asynchronous Presentation)
+## Phase 3 — Decoupled Runtime Pacing with Total Resource Ownership
 
-**Objective:** Replace failed dual-submit assumptions with a runtime-compliant decoupled model that owns headset-rate pacing on a dedicated layer thread.
+**Objective:** Replace failed metadata-queue assumptions with a controlled architecture where the layer owns synchronization guarantees and cross-thread image lifetime.
 
-### Tasks
-1. Implement an **independent runtime submission thread** in the layer that continuously drives:
-   - `xrWaitFrame -> xrBeginFrame -> xrEndFrame`
-   - one runtime submit opportunity per runtime cadence tick.
-2. Keep the **application thread unthrottled**:
-   - do not artificially block app-facing `xrWaitFrame`
-   - map app-produced frames to the next eligible predicted display time in layer-managed state.
-3. Implement the **Holding Pen (ring buffer)** in `FrameBroker`:
-   - on app `xrEndFrame`, capture frame payload + timing metadata into a bounded queue
-   - return `XR_SUCCESS` to app without immediately forwarding submit to runtime thread path.
-4. Implement runtime-thread **dynamic decision policy** at each submit deadline:
-   - Path A (on-time): if a fresh app frame is queued, submit it unmodified
-   - Path B (deadline miss): synthesize from buffered history and submit synthetic output.
-5. Implement **fractional Δt motion scaling**:
-   - compute scaling from source frame timestamps to runtime target `predictedDisplayTime`
-   - feed scaled vectors/pose-warp inputs into synthesis path.
-6. Add pacing instrumentation:
-   - app `predictedDisplayTime`
-   - app frame enqueue time
-   - runtime thread `predictedDisplayTime`
-   - synthesis completion time
-   - actual runtime submit time.
-7. Validate runtime acceptance/compositor stability under decoupled mode, including queue pressure, stale-frame behavior, and fallback correctness.
+### Phase 3A — Color-Only Decoupled Runtime Thread (No Synthesis Yet)
 
-### Critical Notes
-- Dual-submit from a single app frame is now considered a rejected approach for this project path.
-- The runtime thread must remain OpenXR-order compliant and avoid illegal overlap/reentrancy across frame loops.
-- Ring buffer policy must be explicit (drop-oldest vs drop-newest) and observable via tracing.
+**Objective:** Prove stable decoupled pacing first, with color-only forwarding and no depth complexity.
 
-### Exit Criteria
-- Dedicated runtime submission loop is stable at headset cadence.
-- App thread remains unblocked and no longer directly dictates runtime submission cadence.
-- On-time path and synthesis fallback path both produce stable output without runtime state/validation errors.
-- Fractional Δt scaling is active and trace-verified under variable app framerate.
+#### Tasks
+1. Add a **Vulkan API companion interception prerequisite**:
+   - intercept `vkCreateDevice` to force/verify `timelineSemaphore = VK_TRUE`
+   - intercept `vkCmdPipelineBarrier` to sanitize invalid depth aspect masks and illegal layout transitions before they poison layer-managed submission paths.
+2. Add **capability gate + safe fallback** before starting decoupled mode:
+   - if Vulkan interception is unavailable, device creation path is not controllable, or required extensions/features are missing, force `passthrough` mode
+   - never start the decoupled runtime thread in an uncontrolled environment.
+3. Redefine the Holding Pen as **layer-owned images**, not metadata pointers:
+   - allocate private layer-owned Vulkan images for queued color frames
+   - on app `xrEndFrame`, issue `vkCmdCopyImage` (or equivalent compute copy) from app image into layer-owned image
+   - only copied layer-owned images are allowed to cross the app-thread/runtime-thread boundary.
+4. Implement dedicated runtime thread pacing loop:
+   - runtime thread owns `xrWaitFrame -> xrBeginFrame -> xrEndFrame`
+   - app thread remains unthrottled and enqueues copied color frames + timing metadata.
+5. Make Phase 3 explicitly **color-only**:
+   - strip or ignore `XrCompositionLayerDepthInfoKHR` chains in decoupled mode during 3A
+   - submit color-only projection layers until decoupled pacing is proven stable.
+6. Add **graceful synchronization teardown**:
+   - on `xrDestroySession`, stop runtime thread deterministically
+   - wait for queue/device idle (`vkQueueWaitIdle` or `vkDeviceWaitIdle`) before freeing layer-owned images
+   - prevent `vkFreeMemory while in use` during shutdown.
+7. Add instrumentation and observability:
+   - capability-gate decision reason
+   - app enqueue timestamp + frame id
+   - runtime predicted display time + submit timestamp
+   - queue depth and drop policy actions (drop-oldest/drop-newest).
+
+#### Exit Criteria
+- Decoupled runtime thread runs stably at headset cadence in color-only mode.
+- App thread stays unblocked and no runtime validation/state errors occur.
+- No use-after-free or memory-in-use teardown failures on session shutdown.
+- Capability-gate fallback reliably reverts to passthrough on unsupported paths.
+
+### Phase 3B — Synthesis-on-Demand in Decoupled Mode (Still Color-Only)
+
+**Objective:** Add gap-filling synthesis to the proven 3A pacing architecture without reintroducing depth complexity.
+
+#### Tasks
+1. Add runtime-thread deadline decision policy:
+   - Path A: submit fresh queued real frame when available
+   - Path B: synthesize from recent layer-owned color history when deadline would be missed.
+2. Implement **fractional Δt scaling** for motion vectors and pose warp:
+   - compute from buffered frame timestamps to runtime target `predictedDisplayTime`
+   - trace both raw and scaled Δt values for validation.
+3. Keep synthesis strictly color-only in 3B:
+   - no depth chain submission/re-attachment in this phase.
+4. Validate compositor behavior under mixed real/synthetic color-only submits.
+
+#### Exit Criteria
+- On-time and synthesis fallback paths are both stable in decoupled mode.
+- Fractional Δt scaling is active, traceable, and visually consistent under variable app framerate.
+- No regression in frame pacing or synchronization stability from 3A baseline.
 
 ---
 
-## Phase 4 — Depth + Pose Correctness Validation
+## Phase 4 — Depth Ownership + Depth-Chain Reintegration
 
-**Objective:** Eliminate 3D instability artifacts in-headset.
+**Objective:** Add depth back only after Phase 3 color-only decoupled mode is production-stable.
 
 ### Tasks
-1. Validate and lock depth policy:
+1. Implement layer-owned depth resource path:
+   - allocate private depth images compatible with runtime submission requirements
+   - deep-copy app depth (`D32_SFLOAT` and supported formats) into layer-owned depth images aligned with color holding-pen frames.
+2. Reinstate depth extension chains on layer-submitted frames:
+   - attach valid `XrCompositionLayerDepthInfoKHR` chains to real and synthetic submissions
+   - ensure chain lifetime ownership is fully inside layer-managed memory for call scope.
+3. Validate depth convention and correctness in decoupled mode:
    - reversed-Z handling
    - near/far linearization
-   - depth range consistency.
-2. Validate pose-delta direction/sign in pre-warp (no inversion).
-3. If supported in path, include synthesized depth submission and observe runtime reprojection effects.
+   - depth range consistency across real and synthetic paths.
+4. Validate pose-delta direction/sign in pre-warp with depth-enabled synthesis.
+5. Validate compositor/runtime behavior with depth-enabled decoupled submission.
 
 ### Exit Criteria
+- Depth chains are stable and valid on decoupled real/synthetic submissions.
 - No major parallax inversion/background drift.
-- Near geometry (cockpit/interior) stable under head motion.
+- Near geometry (cockpit/interior) remains stable under head motion with depth enabled.
 
 ---
 
@@ -196,11 +225,10 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 
 ## Strict Priority Order
 
-1. Item 10 lifecycle + rewrite completion.
-2. Full live GPU stage wiring.
-3. Decoupled runtime pacing architecture (independent runtime thread + buffered/synth fallback).
-4. Depth/pose correctness.
-5. Packaging + in-game execution.
+1. Phase 3A color-only decoupled runtime pacing with layer-owned images.
+2. Phase 3B synthesis-on-demand in decoupled color-only mode.
+3. Phase 4 depth ownership + depth-chain reintegration.
+4. Packaging + in-game execution.
 
 ---
 
