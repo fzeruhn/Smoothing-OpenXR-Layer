@@ -38,6 +38,7 @@
 #include <log.h>
 #include <util.h>
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <cuda.h>
 
@@ -76,6 +77,20 @@ namespace openxr_api_layer {
     const std::vector<std::string> blockedExtensions = {};
     const std::vector<std::string> implicitExtensions = {};
 
+    class OpenXrLayer;
+
+    XrResult XRAPI_CALL xrGetVulkanInstanceExtensionsKHR_intercept(XrInstance instance,
+                                                                    XrSystemId systemId,
+                                                                    uint32_t bufferCapacityInput,
+                                                                    uint32_t* bufferCountOutput,
+                                                                    char* buffer);
+
+    XrResult XRAPI_CALL xrGetVulkanDeviceExtensionsKHR_intercept(XrInstance instance,
+                                                                  XrSystemId systemId,
+                                                                  uint32_t bufferCapacityInput,
+                                                                  uint32_t* bufferCountOutput,
+                                                                  char* buffer);
+
     class VulkanFrameProcessor {
       public:
         static constexpr uint32_t kCommandBufferRingSize = 3;
@@ -102,6 +117,25 @@ namespace openxr_api_layer {
             return m_valid;
         }
 
+        void PollCompletedWork() {
+            for (uint32_t slot = 0; slot < kCommandBufferRingSize; ++slot) {
+                auto& work = m_slotWork[slot];
+                if (!work.submitted) {
+                    continue;
+                }
+
+                const VkResult fenceStatus = vkGetFenceStatus(m_device, m_submitFences[slot]);
+                if (fenceStatus == VK_SUCCESS) {
+                    work.submitted = false;
+                    if (work.frameId > m_lastCompletedFrameId) {
+                        m_lastCompletedFrameId = work.frameId;
+                        m_latestStageValidity = work.validity;
+                        m_latestOutputColor = work.output;
+                    }
+                }
+            }
+        }
+
         const StageValidity& GetLatestStageValidity() const {
             return m_latestStageValidity;
         }
@@ -120,6 +154,10 @@ namespace openxr_api_layer {
 
         bool IsLivePipelineReady() const {
             return m_livePipelineReady;
+        }
+
+        const char* GetLastPipelineFailureReason() const {
+            return m_lastPipelineFailureReason.c_str();
         }
 
         bool WaitForCopyCompletion() const {
@@ -141,24 +179,64 @@ namespace openxr_api_layer {
         }
 
       private:
+        bool SelectCudaDeviceForVulkan() {
+            VkPhysicalDeviceIDProperties idProps{};
+            idProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+            VkPhysicalDeviceProperties2 props2{};
+            props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            props2.pNext = &idProps;
+            vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+
+            int cudaDeviceCount = 0;
+            if (cuDeviceGetCount(&cudaDeviceCount) != CUDA_SUCCESS || cudaDeviceCount <= 0) {
+                m_lastPipelineFailureReason = "No CUDA devices available";
+                return false;
+            }
+
+            for (int i = 0; i < cudaDeviceCount; ++i) {
+                CUdevice candidate{};
+                if (cuDeviceGet(&candidate, i) != CUDA_SUCCESS) {
+                    continue;
+                }
+
+                CUuuid cuUuid{};
+                if (cuDeviceGetUuid(&cuUuid, candidate) != CUDA_SUCCESS) {
+                    continue;
+                }
+
+                if (memcmp(cuUuid.bytes, idProps.deviceUUID, VK_UUID_SIZE) == 0) {
+                    m_cuDevice = candidate;
+                    return true;
+                }
+            }
+
+            m_lastPipelineFailureReason = "No CUDA device matched Vulkan physical device UUID";
+            return false;
+        }
+
         bool EnsureCudaContext() {
             if (m_cudaContextReady) {
                 return true;
             }
 
             if (cuInit(0) != CUDA_SUCCESS) {
+                m_lastPipelineFailureReason = "cuInit failed";
                 return false;
             }
-            if (cuDeviceGet(&m_cuDevice, 0) != CUDA_SUCCESS) {
+
+            if (!SelectCudaDeviceForVulkan()) {
                 return false;
             }
             if (cuDevicePrimaryCtxRetain(&m_cuContext, m_cuDevice) != CUDA_SUCCESS) {
+                m_lastPipelineFailureReason = "cuDevicePrimaryCtxRetain failed";
                 return false;
             }
             if (cuCtxSetCurrent(m_cuContext) != CUDA_SUCCESS) {
+                m_lastPipelineFailureReason = "cuCtxSetCurrent failed";
                 return false;
             }
             if (cuStreamCreate(&m_cuStream, CU_STREAM_NON_BLOCKING) != CUDA_SUCCESS) {
+                m_lastPipelineFailureReason = "cuStreamCreate failed";
                 return false;
             }
 
@@ -175,6 +253,34 @@ namespace openxr_api_layer {
                 return true;
             }
 
+            if (m_livePipelineInitFailed && m_pipelineWidth == width && m_pipelineHeight == height) {
+                return false;
+            }
+
+            if (m_pipelineWidth != width || m_pipelineHeight != height) {
+                if (m_grayCurrent != 0) {
+                    cuMemFree(m_grayCurrent);
+                    m_grayCurrent = 0;
+                }
+                if (m_grayPrevious != 0) {
+                    cuMemFree(m_grayPrevious);
+                    m_grayPrevious = 0;
+                }
+                m_holeFiller.reset();
+                m_frameSynthesizer.reset();
+                m_ofaPipeline.reset();
+                m_cudaToVk.reset();
+                m_vkToCuda.reset();
+                m_stageOutputColor.reset();
+                m_stagePreviousColor.reset();
+                m_stageCurrentColor.reset();
+                m_livePipelineReady = false;
+                m_pendingCudaOutput = false;
+                m_stageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                m_stagePreviousLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                m_stageOutputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            }
+
             try {
                 m_stageCurrentColor = std::make_unique<interop::SharedImage>(
                     m_device, m_physicalDevice, width, height, VK_FORMAT_R8G8B8A8_UNORM);
@@ -182,6 +288,10 @@ namespace openxr_api_layer {
                     m_device, m_physicalDevice, width, height, VK_FORMAT_R8G8B8A8_UNORM);
                 m_stageOutputColor = std::make_unique<interop::SharedImage>(
                     m_device, m_physicalDevice, width, height, VK_FORMAT_R8G8B8A8_UNORM);
+
+                m_stageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                m_stagePreviousLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                m_stageOutputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
                 m_vkToCuda = std::make_unique<interop::SharedSemaphore>(m_device);
                 m_cudaToVk = std::make_unique<interop::SharedSemaphore>(m_device);
@@ -200,16 +310,31 @@ namespace openxr_api_layer {
                 m_pipelineWidth = width;
                 m_pipelineHeight = height;
                 m_livePipelineReady = true;
+                m_livePipelineInitFailed = false;
+                m_lastPipelineFailureReason.clear();
                 return true;
+            } catch (const std::exception& e) {
+                m_livePipelineReady = false;
+                m_livePipelineInitFailed = true;
+                m_pipelineWidth = width;
+                m_pipelineHeight = height;
+                m_lastPipelineFailureReason = e.what();
+                Log(fmt::format("[ERROR] EnsureLivePipeline failed: {}\n", m_lastPipelineFailureReason));
+                return false;
             } catch (...) {
                 m_livePipelineReady = false;
+                m_livePipelineInitFailed = true;
+                m_pipelineWidth = width;
+                m_pipelineHeight = height;
+                m_lastPipelineFailureReason = "Unknown exception while building live pipeline";
+                Log("[ERROR] EnsureLivePipeline failed with unknown exception.\n");
                 return false;
             }
         }
 
         bool Initialize(uint32_t queueFamilyIndex) {
             if (!EnsureCudaContext()) {
-                Log("[ERROR] Failed to initialize CUDA context for VulkanFrameProcessor.\n");
+                Log(fmt::format("[ERROR] Failed to initialize CUDA context for VulkanFrameProcessor: {}\n", m_lastPipelineFailureReason));
             }
 
             // Create Command Pool for compute/graphics operations
@@ -411,6 +536,20 @@ namespace openxr_api_layer {
             if (sourceIsCudaOutput) {
                 m_pendingCudaOutput = false;
             }
+
+            const uint64_t frameId = ++m_frameIdCounter;
+            m_slotWork[slot].submitted = true;
+            m_slotWork[slot].frameId = frameId;
+            m_slotWork[slot].validity = StageValidity{
+                true,  // preWarp
+                true,  // ofa/copy stage treated as valid for transfer path
+                true,  // depthLinearization
+                true,  // stereoAdaptation
+                true,  // synthesis
+                true   // holeFill
+            };
+            m_slotWork[slot].output = sourceColor;
+
             ++m_submitIndex;
 
             return true;
@@ -419,6 +558,8 @@ namespace openxr_api_layer {
         // ASYNCHRONOUS processing. No vkQueueWaitIdle!
         bool ProcessFrames(
             VkImage colorCurrent, VkImage depthCurrent, VkImage colorPrevious, VkImage depthPrevious, uint32_t width, uint32_t height) {
+            PollCompletedWork();
+
             if (!colorPrevious || !depthPrevious)
                 return false; // Need two frames to do motion vectors
 
@@ -490,6 +631,17 @@ namespace openxr_api_layer {
                                      &barrier);
             };
 
+            auto transitionTracked = [&](VkImage image,
+                                         VkImageLayout& trackedLayout,
+                                         VkImageLayout newLayout,
+                                         VkAccessFlags srcAccess,
+                                         VkAccessFlags dstAccess,
+                                         VkPipelineStageFlags srcStage,
+                                         VkPipelineStageFlags dstStage) {
+                transitionImage(image, trackedLayout, newLayout, srcAccess, dstAccess, srcStage, dstStage);
+                trackedLayout = newLayout;
+            };
+
             transitionImage(colorCurrent,
                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -506,21 +658,21 @@ namespace openxr_api_layer {
                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                             VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-            transitionImage(m_stageCurrentColor->vkImage(),
-                            VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            0,
-                            VK_ACCESS_TRANSFER_WRITE_BIT,
-                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT);
+            transitionTracked(m_stageCurrentColor->vkImage(),
+                              m_stageCurrentLayout,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              0,
+                              VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-            transitionImage(m_stagePreviousColor->vkImage(),
-                            VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            0,
-                            VK_ACCESS_TRANSFER_WRITE_BIT,
-                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT);
+            transitionTracked(m_stagePreviousColor->vkImage(),
+                              m_stagePreviousLayout,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              0,
+                              VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT);
 
             VkImageCopy copyRegion{};
             copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -564,21 +716,29 @@ namespace openxr_api_layer {
                             VK_PIPELINE_STAGE_TRANSFER_BIT,
                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
-            transitionImage(m_stageCurrentColor->vkImage(),
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            VK_IMAGE_LAYOUT_GENERAL,
-                            VK_ACCESS_TRANSFER_WRITE_BIT,
-                            VK_ACCESS_SHADER_READ_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            transitionTracked(m_stageCurrentColor->vkImage(),
+                              m_stageCurrentLayout,
+                              VK_IMAGE_LAYOUT_GENERAL,
+                              VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-            transitionImage(m_stagePreviousColor->vkImage(),
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            VK_IMAGE_LAYOUT_GENERAL,
-                            VK_ACCESS_TRANSFER_WRITE_BIT,
-                            VK_ACCESS_SHADER_READ_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            transitionTracked(m_stagePreviousColor->vkImage(),
+                              m_stagePreviousLayout,
+                              VK_IMAGE_LAYOUT_GENERAL,
+                              VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+            transitionTracked(m_stageOutputColor->vkImage(),
+                              m_stageOutputLayout,
+                              VK_IMAGE_LAYOUT_GENERAL,
+                              0,
+                              VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
             CHECK_VK_LAYER(vkEndCommandBuffer(cmd));
 
@@ -617,10 +777,14 @@ namespace openxr_api_layer {
 
             m_cudaToVk->signal(m_cuStream);
             m_pendingCudaOutput = true;
-            ++m_submitIndex;
 
-            m_latestStageValidity = stageValidity;
-            m_latestOutputColor = stageValidity.FullyValid() ? m_stageOutputColor->vkImage() : VK_NULL_HANDLE;
+            const uint64_t frameId = ++m_frameIdCounter;
+            m_slotWork[slot].submitted = true;
+            m_slotWork[slot].frameId = frameId;
+            m_slotWork[slot].validity = stageValidity;
+            m_slotWork[slot].output = stageValidity.FullyValid() ? m_stageOutputColor->vkImage() : VK_NULL_HANDLE;
+
+            ++m_submitIndex;
 
             return stageValidity.FullyValid();
         }
@@ -637,11 +801,25 @@ namespace openxr_api_layer {
         StageValidity m_latestStageValidity{};
         VkImage m_latestOutputColor{VK_NULL_HANDLE};
         uint32_t m_fenceBusyCount{0};
+        struct SlotWork {
+            bool submitted{false};
+            uint64_t frameId{0};
+            StageValidity validity{};
+            VkImage output{VK_NULL_HANDLE};
+        };
+        std::array<SlotWork, kCommandBufferRingSize> m_slotWork{};
+        uint64_t m_frameIdCounter{0};
+        uint64_t m_lastCompletedFrameId{0};
         bool m_livePipelineReady{false};
+        bool m_livePipelineInitFailed{false};
         bool m_cudaContextReady{false};
         bool m_pendingCudaOutput{false};
         uint32_t m_pipelineWidth{0};
         uint32_t m_pipelineHeight{0};
+        VkImageLayout m_stageCurrentLayout{VK_IMAGE_LAYOUT_UNDEFINED};
+        VkImageLayout m_stagePreviousLayout{VK_IMAGE_LAYOUT_UNDEFINED};
+        VkImageLayout m_stageOutputLayout{VK_IMAGE_LAYOUT_UNDEFINED};
+        std::string m_lastPipelineFailureReason{};
         CUdevice m_cuDevice{};
         CUcontext m_cuContext{nullptr};
         CUstream m_cuStream{nullptr};
@@ -664,6 +842,100 @@ namespace openxr_api_layer {
         OpenXrLayer() = default;
         ~OpenXrLayer() = default;
 
+        XrResult xrGetVulkanInstanceExtensionsKHR(XrInstance instance,
+                                                  XrSystemId systemId,
+                                                  uint32_t bufferCapacityInput,
+                                                  uint32_t* bufferCountOutput,
+                                                  char* buffer) {
+            ResolveVulkanExtensionFunctions(instance);
+            if (m_xrGetVulkanInstanceExtensionsKHR == nullptr) {
+                return XR_ERROR_FUNCTION_UNSUPPORTED;
+            }
+            return m_xrGetVulkanInstanceExtensionsKHR(instance, systemId, bufferCapacityInput, bufferCountOutput, buffer);
+        }
+
+        XrResult xrGetVulkanDeviceExtensionsKHR(XrInstance instance,
+                                                XrSystemId systemId,
+                                                uint32_t bufferCapacityInput,
+                                                uint32_t* bufferCountOutput,
+                                                char* buffer) {
+            ResolveVulkanExtensionFunctions(instance);
+            if (m_xrGetVulkanDeviceExtensionsKHR == nullptr) {
+                return XR_ERROR_FUNCTION_UNSUPPORTED;
+            }
+
+            uint32_t runtimeCount = 0;
+            const XrResult queryResult = m_xrGetVulkanDeviceExtensionsKHR(instance, systemId, 0, &runtimeCount, nullptr);
+            if (XR_FAILED(queryResult)) {
+                return queryResult;
+            }
+
+            std::string runtimeExtensions;
+            runtimeExtensions.resize(runtimeCount == 0 ? 0 : runtimeCount - 1);
+            if (runtimeCount > 0) {
+                std::vector<char> runtimeBuffer(runtimeCount);
+                const XrResult fetchResult =
+                    m_xrGetVulkanDeviceExtensionsKHR(instance, systemId, runtimeCount, &runtimeCount, runtimeBuffer.data());
+                if (XR_FAILED(fetchResult)) {
+                    return fetchResult;
+                }
+                runtimeExtensions.assign(runtimeBuffer.data());
+            }
+
+            static const std::array<const char*, 4> requiredDeviceExtensions = {
+                "VK_KHR_external_memory",
+                "VK_KHR_external_memory_win32",
+                "VK_KHR_external_semaphore",
+                "VK_KHR_external_semaphore_win32",
+            };
+
+            std::istringstream extStream(runtimeExtensions);
+            std::vector<std::string> extensions;
+            std::string token;
+            while (extStream >> token) {
+                extensions.push_back(token);
+            }
+
+            auto hasExtension = [&](const char* extension) {
+                return std::find(extensions.begin(), extensions.end(), extension) != extensions.end();
+            };
+
+            for (const char* extension : requiredDeviceExtensions) {
+                if (!hasExtension(extension)) {
+                    extensions.emplace_back(extension);
+                }
+            }
+
+            std::string mergedExtensions;
+            for (size_t i = 0; i < extensions.size(); ++i) {
+                if (i != 0) {
+                    mergedExtensions.push_back(' ');
+                }
+                mergedExtensions += extensions[i];
+            }
+
+            const uint32_t mergedCount = static_cast<uint32_t>(mergedExtensions.size()) + 1;
+            if (bufferCountOutput != nullptr) {
+                *bufferCountOutput = mergedCount;
+            }
+
+            TraceLoggingWrite(g_traceProvider,
+                              "Vulkan_Device_Extensions",
+                              TLArg(runtimeExtensions.c_str(), "RuntimeExtensions"),
+                              TLArg(mergedExtensions.c_str(), "MergedExtensions"));
+
+            if (bufferCapacityInput == 0 || buffer == nullptr) {
+                return XR_SUCCESS;
+            }
+
+            if (bufferCapacityInput < mergedCount) {
+                return XR_ERROR_SIZE_INSUFFICIENT;
+            }
+
+            strcpy_s(buffer, bufferCapacityInput, mergedExtensions.c_str());
+            return XR_SUCCESS;
+        }
+
         // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetInstanceProcAddr
         XrResult xrGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function) override {
             TraceLoggingWrite(g_traceProvider,
@@ -671,6 +943,17 @@ namespace openxr_api_layer {
                               TLXArg(instance, "Instance"),
                               TLArg(name, "Name"),
                               TLArg(m_bypassApiLayer, "Bypass"));
+
+            if (!m_bypassApiLayer && name != nullptr && function != nullptr) {
+                if (strcmp(name, "xrGetVulkanInstanceExtensionsKHR") == 0) {
+                    *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetVulkanInstanceExtensionsKHR_intercept);
+                    return XR_SUCCESS;
+                }
+                if (strcmp(name, "xrGetVulkanDeviceExtensionsKHR") == 0) {
+                    *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetVulkanDeviceExtensionsKHR_intercept);
+                    return XR_SUCCESS;
+                }
+            }
 
             XrResult result = m_bypassApiLayer ? m_xrGetInstanceProcAddr(instance, name, function)
                                                : OpenXrApi::xrGetInstanceProcAddr(instance, name, function);
@@ -688,6 +971,7 @@ namespace openxr_api_layer {
 
             // Needed to resolve the requested function pointers.
             OpenXrApi::xrCreateInstance(createInfo);
+            ResolveVulkanExtensionFunctions(GetXrInstance());
 
             // Dump the application name, OpenXR runtime information and other useful things for debugging.
             TraceLoggingWrite(g_traceProvider,
@@ -905,8 +1189,6 @@ namespace openxr_api_layer {
         // 4. HOOK END FRAME (The trigger to copy the data)
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             if (session == m_session && m_apiType == GraphicsAPI::Vulkan) {
-                m_synthesizedColor = VK_NULL_HANDLE;
-                m_hasSynthesisOutput = false;
                 m_frameContext = FrameContext{};
                 const XrCompositionLayerProjection* projectionLayer = nullptr;
 
@@ -953,6 +1235,9 @@ namespace openxr_api_layer {
                 if (projectionLayer) {
                     if (m_enableFrameRewrite) {
                         m_frameInjection.EnsureSwapchain(*this, session, m_frameBroker);
+                        if (m_frameInjection.IsReady() && m_injectionVulkanImages.empty()) {
+                            EnsureInjectionSwapchainImagesEnumerated();
+                        }
                     }
                     m_depthProvider.SetSwapchainImageLookup(m_frameBroker.GetVulkanImages(), m_frameBroker.GetAcquiredIndices());
                     const XrResult poseResult =
@@ -996,6 +1281,8 @@ namespace openxr_api_layer {
 
                 // 3. Process if we have a previous frame!
                 if (m_processor && currentColor && currentDepth && m_prevColor && m_prevDepth) {
+                    m_processor->PollCompletedWork();
+
                     // TODO (Item 4): Pre-OFA pose pre-warp
                     // When Item 2 (Pose Data Pipeline) is complete:
                     //   1. Extract XrPosef render_pose and display_pose from frameEndInfo projection layers
@@ -1015,7 +1302,8 @@ namespace openxr_api_layer {
                         m_prevDepth,
                         m_frameBroker.GetSwapchainWidth(),
                         m_frameBroker.GetSwapchainHeight());
-                    if (submitted && m_processor->HasFullyValidOutput()) {
+                    (void)submitted;
+                    if (m_processor->HasFullyValidOutput()) {
                         m_synthesizedColor = m_processor->GetLatestOutputImage();
                         m_hasSynthesisOutput = true;
 
@@ -1029,7 +1317,22 @@ namespace openxr_api_layer {
                                           TLArg(stageValidity.synthesis, "Synthesis"),
                                           TLArg(stageValidity.holeFill, "HoleFill"),
                                           TLArg(stageValidity.FullyValid(), "FullyValid"));
-                    } else if (m_processor->GetFenceBusyCount() >= VulkanFrameProcessor::kCommandBufferRingSize) {
+                    } else {
+                        const auto& stageValidity = m_processor->GetLatestStageValidity();
+                        TraceLoggingWrite(g_traceProvider,
+                                          "Synthesis_Stage_Validity",
+                                          TLArg(stageValidity.preWarp, "PreWarp"),
+                                          TLArg(stageValidity.ofa, "OFA"),
+                                          TLArg(stageValidity.depthLinearization, "DepthLinearization"),
+                                          TLArg(stageValidity.stereoAdaptation, "StereoAdaptation"),
+                                          TLArg(stageValidity.synthesis, "Synthesis"),
+                                          TLArg(stageValidity.holeFill, "HoleFill"),
+                                          TLArg(stageValidity.FullyValid(), "FullyValid"),
+                                          TLArg(m_processor->IsLivePipelineReady(), "LivePipelineReady"),
+                                          TLArg(m_processor->GetLastPipelineFailureReason(), "FailureReason"));
+                    }
+
+                    if (m_processor->GetFenceBusyCount() >= VulkanFrameProcessor::kCommandBufferRingSize) {
                         TraceLoggingWrite(g_traceProvider,
                                           "Synthesis_Fence_Starvation",
                                           TLArg(m_processor->GetFenceBusyCount(), "BusyStreak"));
@@ -1067,7 +1370,8 @@ namespace openxr_api_layer {
                 if (!synthesisReady) {
                     TraceLoggingWrite(g_traceProvider,
                                       "Frame_Rewrite_Skipped",
-                                      TLArg("SynthesisNotReady", "Reason"));
+                                      TLArg("NoCompletedOutputYet", "Reason"),
+                                      TLArg(m_processor ? m_processor->GetLastPipelineFailureReason() : "", "PipelineFailureReason"));
                 }
 
                 if (synthesisReady && m_xrWaitSwapchainImage != nullptr && m_xrReleaseSwapchainImage != nullptr) {
@@ -1171,6 +1475,52 @@ namespace openxr_api_layer {
 
 
       private:
+        void EnsureInjectionSwapchainImagesEnumerated() {
+            if (!m_frameInjection.IsReady()) {
+                return;
+            }
+
+            uint32_t imageCount = 0;
+            XrResult result = xrEnumerateSwapchainImages(m_frameInjection.Swapchain(), 0, &imageCount, nullptr);
+            if (XR_FAILED(result) || imageCount == 0) {
+                TraceLoggingWrite(g_traceProvider,
+                                  "Injection_Enumerate_Failed",
+                                  TLArg(xr::ToCString(result), "Result"),
+                                  TLArg(imageCount, "ImageCount"));
+                return;
+            }
+
+            std::vector<XrSwapchainImageVulkanKHR> images(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+            result = xrEnumerateSwapchainImages(m_frameInjection.Swapchain(),
+                                                imageCount,
+                                                &imageCount,
+                                                reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data()));
+            if (XR_FAILED(result)) {
+                TraceLoggingWrite(g_traceProvider,
+                                  "Injection_Enumerate_Failed",
+                                  TLArg(xr::ToCString(result), "Result"),
+                                  TLArg(imageCount, "ImageCount"));
+            }
+        }
+
+        void ResolveVulkanExtensionFunctions(XrInstance instance) {
+            if (instance == XR_NULL_HANDLE || m_xrGetInstanceProcAddr == nullptr) {
+                return;
+            }
+
+            PFN_xrVoidFunction function = nullptr;
+            if (m_xrGetVulkanInstanceExtensionsKHR == nullptr &&
+                XR_SUCCEEDED(m_xrGetInstanceProcAddr(instance, "xrGetVulkanInstanceExtensionsKHR", &function))) {
+                m_xrGetVulkanInstanceExtensionsKHR = reinterpret_cast<PFN_xrGetVulkanInstanceExtensionsKHR>(function);
+            }
+
+            function = nullptr;
+            if (m_xrGetVulkanDeviceExtensionsKHR == nullptr &&
+                XR_SUCCEEDED(m_xrGetInstanceProcAddr(instance, "xrGetVulkanDeviceExtensionsKHR", &function))) {
+                m_xrGetVulkanDeviceExtensionsKHR = reinterpret_cast<PFN_xrGetVulkanDeviceExtensionsKHR>(function);
+            }
+        }
+
         bool isSystemHandled(XrSystemId systemId) const {return systemId == m_systemId;}
         enum class GraphicsAPI { Unknown, DX11, Vulkan };
         GraphicsAPI m_apiType{GraphicsAPI::Unknown};
@@ -1179,6 +1529,8 @@ namespace openxr_api_layer {
         XrSession m_session{XR_NULL_HANDLE};
 
         std::unique_ptr<VulkanFrameProcessor> m_processor;
+        PFN_xrGetVulkanInstanceExtensionsKHR m_xrGetVulkanInstanceExtensionsKHR{nullptr};
+        PFN_xrGetVulkanDeviceExtensionsKHR m_xrGetVulkanDeviceExtensionsKHR{nullptr};
         FrameBroker m_frameBroker;
         FrameInjection m_frameInjection;
         bool m_enableFrameRewrite{true};
@@ -1223,6 +1575,30 @@ namespace openxr_api_layer {
         //   5. Call m_poseWarper->warp() on m_prevColor before feeding to OFA
         // This will significantly improve OFA quality by removing camera motion from flow field.
     };
+
+    XrResult XRAPI_CALL xrGetVulkanInstanceExtensionsKHR_intercept(XrInstance instance,
+                                                                    XrSystemId systemId,
+                                                                    uint32_t bufferCapacityInput,
+                                                                    uint32_t* bufferCountOutput,
+                                                                    char* buffer) {
+        auto* layer = dynamic_cast<OpenXrLayer*>(GetInstance());
+        if (layer == nullptr) {
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
+        return layer->xrGetVulkanInstanceExtensionsKHR(instance, systemId, bufferCapacityInput, bufferCountOutput, buffer);
+    }
+
+    XrResult XRAPI_CALL xrGetVulkanDeviceExtensionsKHR_intercept(XrInstance instance,
+                                                                  XrSystemId systemId,
+                                                                  uint32_t bufferCapacityInput,
+                                                                  uint32_t* bufferCountOutput,
+                                                                  char* buffer) {
+        auto* layer = dynamic_cast<OpenXrLayer*>(GetInstance());
+        if (layer == nullptr) {
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
+        return layer->xrGetVulkanDeviceExtensionsKHR(instance, systemId, bufferCapacityInput, bufferCountOutput, buffer);
+    }
 
     // This method is required by the framework to instantiate your OpenXrApi implementation.
     OpenXrApi* GetInstance() {
