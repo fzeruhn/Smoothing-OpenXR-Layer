@@ -63,6 +63,19 @@ static CUtexObject makeTexObject(CUarray arr)
     return tex;
 }
 
+__global__ void kernel_convert_vectors_s10_5_to_float2(const short2* __restrict__ src,
+                                                       float2* __restrict__ dst,
+                                                       uint32_t count) {
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+
+    const short2 v = src[idx];
+    dst[idx] = make_float2(static_cast<float>(v.x) / 32.0f,
+                           static_cast<float>(v.y) / 32.0f);
+}
+
 static CUsurfObject makeSurfObject(CUarray arr)
 {
     CUDA_RESOURCE_DESC rd = {};
@@ -301,7 +314,7 @@ void FrameSynthesizer::loadMotionVectors(const SynthFlowVector* hostVectors,
 // FrameSynthesizer — execute
 // ---------------------------------------------------------------------------
 
-void FrameSynthesizer::execute(CUstream /*stream*/)
+void FrameSynthesizer::execute(CUstream stream, bool synchronize)
 {
     // --- Initialise scatter buffer to sentinel (all bytes 0xFF) ---
     CHECK_CU(cuMemsetD8(m_scatterBuf, 0xFF,
@@ -323,7 +336,9 @@ void FrameSynthesizer::execute(CUstream /*stream*/)
                     (m_height + 15) / 16);
 
     // --- Pass 1a: forward scatter from frame N ---
-    kernel_scatter<<<grid, block>>>(
+    cudaStream_t rtStream = reinterpret_cast<cudaStream_t>(stream);
+
+    kernel_scatter<<<grid, block, 0, rtStream>>>(
         reinterpret_cast<unsigned long long*>(m_scatterBuf),
         reinterpret_cast<const float2*>(m_vecBufGrid),
         (cudaTextureObject_t)depthTexN,
@@ -334,7 +349,7 @@ void FrameSynthesizer::execute(CUstream /*stream*/)
         false);
 
     // --- Pass 1b: backward scatter from frame N+1 ---
-    kernel_scatter<<<grid, block>>>(
+    kernel_scatter<<<grid, block, 0, rtStream>>>(
         reinterpret_cast<unsigned long long*>(m_scatterBuf),
         reinterpret_cast<const float2*>(m_vecBufGrid),
         (cudaTextureObject_t)depthTexN1,
@@ -345,7 +360,7 @@ void FrameSynthesizer::execute(CUstream /*stream*/)
         true);
 
     // --- Pass 2: gather + blend ---
-    kernel_gather_blend<<<grid, block>>>(
+    kernel_gather_blend<<<grid, block, 0, rtStream>>>(
         (cudaSurfaceObject_t)surfOut,
         (cudaSurfaceObject_t)surfHole,
         reinterpret_cast<const unsigned long long*>(m_scatterBuf),
@@ -353,8 +368,13 @@ void FrameSynthesizer::execute(CUstream /*stream*/)
         (cudaTextureObject_t)texN1,
         m_width, m_height);
 
-    // Synchronise (stream parameter reserved for future async integration)
-    CHECK_CU(cuCtxSynchronize());
+    if (synchronize) {
+        if (stream != nullptr) {
+            CHECK_CU(cuStreamSynchronize(stream));
+        } else {
+            CHECK_CU(cuCtxSynchronize());
+        }
+    }
 
     // --- Destroy temporary objects ---
     cuSurfObjectDestroy(surfHole);
@@ -363,4 +383,20 @@ void FrameSynthesizer::execute(CUstream /*stream*/)
     if (depthTexN)  cuTexObjectDestroy(depthTexN);
     cuTexObjectDestroy(texN1);
     cuTexObjectDestroy(texN);
+}
+
+void FrameSynthesizer::loadMotionVectorsDevice(CUdeviceptr deviceVectors, size_t count, CUstream stream) {
+    if (count == 0 || deviceVectors == 0) {
+        return;
+    }
+
+    const uint32_t threads = 256;
+    const uint32_t blocks = static_cast<uint32_t>((count + threads - 1) / threads);
+    cudaStream_t rtStream = reinterpret_cast<cudaStream_t>(stream);
+    kernel_convert_vectors_s10_5_to_float2<<<blocks, threads, 0, rtStream>>>(
+        reinterpret_cast<const short2*>(deviceVectors),
+        reinterpret_cast<float2*>(m_vecBufGrid),
+        static_cast<uint32_t>(count));
+
+    CHECK_RT(cudaGetLastError());
 }

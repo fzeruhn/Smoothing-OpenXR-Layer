@@ -272,9 +272,10 @@ void HoleFiller::destroy() noexcept
 // HoleFiller — fill
 // ---------------------------------------------------------------------------
 
-void HoleFiller::fill(CUarray frame, CUarray holeMap, CUstream /*stream*/)
+void HoleFiller::fill(CUarray frame, CUarray holeMap, CUstream stream, bool synchronize)
 {
     const dim3 block(16, 16);
+    cudaStream_t rtStream = reinterpret_cast<cudaStream_t>(stream);
 
     // --- Stage 1: copy frame + holeMap into pyramid[0] ---
     {
@@ -285,7 +286,7 @@ void HoleFiller::fill(CUarray frame, CUarray holeMap, CUstream /*stream*/)
 
         const dim3 grid((m_pyramid[0].w + 15) / 16,
                         (m_pyramid[0].h + 15) / 16);
-        kernel_copy_level0<<<grid, block>>>(
+        kernel_copy_level0<<<grid, block, 0, rtStream>>>(
             (cudaSurfaceObject_t)surfFrame,
             (cudaSurfaceObject_t)surfHole,
             (cudaSurfaceObject_t)surfColor0,
@@ -307,7 +308,7 @@ void HoleFiller::fill(CUarray frame, CUarray holeMap, CUstream /*stream*/)
 
         const dim3 grid((m_pyramid[l].w + 15) / 16,
                         (m_pyramid[l].h + 15) / 16);
-        kernel_push<<<grid, block>>>(
+        kernel_push<<<grid, block, 0, rtStream>>>(
             (cudaSurfaceObject_t)srcColor,
             (cudaSurfaceObject_t)srcValid,
             (cudaSurfaceObject_t)dstColor,
@@ -329,7 +330,7 @@ void HoleFiller::fill(CUarray frame, CUarray holeMap, CUstream /*stream*/)
 
         const dim3 grid((m_pyramid[l].w + 15) / 16,
                         (m_pyramid[l].h + 15) / 16);
-        kernel_pull<<<grid, block>>>(
+        kernel_pull<<<grid, block, 0, rtStream>>>(
             (cudaSurfaceObject_t)dstColor,
             (cudaSurfaceObject_t)dstValid,
             (cudaTextureObject_t)coarserTex,
@@ -348,7 +349,7 @@ void HoleFiller::fill(CUarray frame, CUarray holeMap, CUstream /*stream*/)
 
         const dim3 grid((m_pyramid[0].w + 15) / 16,
                         (m_pyramid[0].h + 15) / 16);
-        kernel_writeback<<<grid, block>>>(
+        kernel_writeback<<<grid, block, 0, rtStream>>>(
             (cudaSurfaceObject_t)surfFrame,
             (cudaSurfaceObject_t)surfColor0,
             (cudaSurfaceObject_t)surfHole,
@@ -359,6 +360,11 @@ void HoleFiller::fill(CUarray frame, CUarray holeMap, CUstream /*stream*/)
         cuSurfObjectDestroy(surfFrame);
     }
 
-    // Synchronise (stream parameter reserved for future async integration)
-    CHECK_CU(cuCtxSynchronize());
+    if (synchronize) {
+        if (stream != nullptr) {
+            CHECK_CU(cuStreamSynchronize(stream));
+        } else {
+            CHECK_CU(cuCtxSynchronize());
+        }
+    }
 }

@@ -59,6 +59,30 @@
     <ClInclude Include="frame_injection.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="frame_synthesizer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="hole_filler.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ofa_pipeline.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="pose_warp.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="pose_warp_math.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="stereo_vector_adapter.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vulkan_cuda_interop.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="gpu_pipeline_kernels.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch.cpp">
@@ -106,6 +130,15 @@
     <ClCompile Include="frame_injection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ofa_pipeline.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="pose_warp_math.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="vulkan_cuda_interop.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="framework\dispatch_generator.py">
@@ -123,5 +156,12 @@
   <ItemGroup>
     <Natvis Include="$(MSBuildThisFileDirectory)..\..\natvis\wil.natvis" />
     <Natvis Include="$(MSBuildThisFileDirectory)..\..\natvis\wil.natstepfilter" />
+  </ItemGroup>
+  <ItemGroup>
+    <CudaCompile Include="frame_synthesizer.cu" />
+    <CudaCompile Include="hole_filler.cu" />
+    <CudaCompile Include="pose_warp.cu" />
+    <CudaCompile Include="stereo_vector_adapter.cu" />
+    <CudaCompile Include="gpu_pipeline_kernels.cu" />
   </ItemGroup>
 </Project>

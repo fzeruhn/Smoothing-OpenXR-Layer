@@ -102,9 +102,13 @@ public:
     // L2 cache reuse (16 threads share each grid cell at 4×4 grid size).
     void loadMotionVectors(const SynthFlowVector* hostVectors, size_t count);
 
-    // Execute the synthesis pipeline synchronously.
-    // stream is reserved for future async integration; currently ignored.
-    void execute(CUstream stream = nullptr);
+    // Execute the synthesis pipeline.
+    // If synchronize=true, waits for completion before returning (test-friendly).
+    // If synchronize=false, caller owns synchronization.
+    void execute(CUstream stream = nullptr, bool synchronize = true);
+
+    // Upload motion vectors from a device buffer in NV_OF SHORT2/S10.5 layout.
+    void loadMotionVectorsDevice(CUdeviceptr deviceVectors, size_t count, CUstream stream = nullptr);
 
     // Output CUarrays — owned by this object, valid until the next execute()
     // call or destruction.

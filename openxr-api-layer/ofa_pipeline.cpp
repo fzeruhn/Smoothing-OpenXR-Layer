@@ -158,10 +158,33 @@ void OFAPipeline::loadFrame(int slot, const void* hostGray8) {
     CHECK_CU(cuMemcpy2D(&cp));
 }
 
+void OFAPipeline::loadFrameDevice(int slot, CUdeviceptr deviceGray8, size_t srcPitch, CUstream stream) {
+    NV_OF_CUDA_BUFFER_STRIDE_INFO si{};
+    CHECK_NVOF(m_api.nvOFGPUBufferGetStrideInfo(m_inputBufs[slot], &si));
+
+    CUdeviceptr devPtr = m_api.nvOFGPUBufferGetCUdeviceptr(m_inputBufs[slot]);
+
+    CUDA_MEMCPY2D cp{};
+    cp.srcMemoryType  = CU_MEMORYTYPE_DEVICE;
+    cp.srcDevice      = deviceGray8;
+    cp.srcPitch       = srcPitch;
+    cp.dstMemoryType  = CU_MEMORYTYPE_DEVICE;
+    cp.dstDevice      = devPtr;
+    cp.dstPitch       = si.strideInfo[0].strideXInBytes;
+    cp.WidthInBytes   = m_width;
+    cp.Height         = m_height;
+
+    if (stream != nullptr) {
+        CHECK_CU(cuMemcpy2DAsync(&cp, stream));
+    } else {
+        CHECK_CU(cuMemcpy2D(&cp));
+    }
+}
+
 // -------------------------------------------------------------------------
 // execute
 // -------------------------------------------------------------------------
-void OFAPipeline::execute(CUstream /*stream*/) {
+void OFAPipeline::execute(CUstream /*stream*/, bool readbackToHost) {
     // `stream` is reserved for Item 4 pre-warp integration.
     // OFA uses its own internal stream; caller must cuCtxSynchronize() after.
 
@@ -175,21 +198,30 @@ void OFAPipeline::execute(CUstream /*stream*/) {
 
     CHECK_NVOF(m_api.nvOFExecute(m_hOf, &in, &out));
 
-    // Copy motion vectors to host staging buffer (caller syncs before reading).
-    NV_OF_CUDA_BUFFER_STRIDE_INFO si{};
-    CHECK_NVOF(m_api.nvOFGPUBufferGetStrideInfo(m_outputBuf, &si));
+    if (readbackToHost) {
+        // Copy motion vectors to host staging buffer (caller syncs before reading).
+        NV_OF_CUDA_BUFFER_STRIDE_INFO si{};
+        CHECK_NVOF(m_api.nvOFGPUBufferGetStrideInfo(m_outputBuf, &si));
 
-    CUdeviceptr outDev  = m_api.nvOFGPUBufferGetCUdeviceptr(m_outputBuf);
-    const uint32_t rowBytes = m_outW * static_cast<uint32_t>(sizeof(NV_OF_FLOW_VECTOR));
+        CUdeviceptr outDev  = m_api.nvOFGPUBufferGetCUdeviceptr(m_outputBuf);
+        const uint32_t rowBytes = m_outW * static_cast<uint32_t>(sizeof(NV_OF_FLOW_VECTOR));
 
-    CUDA_MEMCPY2D cp{};
-    cp.srcMemoryType  = CU_MEMORYTYPE_DEVICE;
-    cp.srcDevice      = outDev;
-    cp.srcPitch       = si.strideInfo[0].strideXInBytes;
-    cp.dstMemoryType  = CU_MEMORYTYPE_HOST;
-    cp.dstHost        = m_hostOutput.data();
-    cp.dstPitch       = rowBytes;
-    cp.WidthInBytes   = rowBytes;
-    cp.Height         = m_outH;
-    CHECK_CU(cuMemcpy2D(&cp));
+        CUDA_MEMCPY2D cp{};
+        cp.srcMemoryType  = CU_MEMORYTYPE_DEVICE;
+        cp.srcDevice      = outDev;
+        cp.srcPitch       = si.strideInfo[0].strideXInBytes;
+        cp.dstMemoryType  = CU_MEMORYTYPE_HOST;
+        cp.dstHost        = m_hostOutput.data();
+        cp.dstPitch       = rowBytes;
+        cp.WidthInBytes   = rowBytes;
+        cp.Height         = m_outH;
+        CHECK_CU(cuMemcpy2D(&cp));
+    }
+}
+
+CUdeviceptr OFAPipeline::outputDevicePtr() const {
+    if (!m_outputBuf) {
+        return 0;
+    }
+    return m_api.nvOFGPUBufferGetCUdeviceptr(m_outputBuf);
 }

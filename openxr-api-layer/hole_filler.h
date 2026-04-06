@@ -60,11 +60,12 @@ public:
     // Fills holes in `frame` in-place using push-pull propagation.
     //   frame:   RGBA8 CUarray — synthesized frame (hole pixels replaced in-place)
     //   holeMap: R8 CUarray   — 0=valid, 255=hole (read-only; not modified)
-    //   stream:  reserved for future async dispatch; currently ignored
+    //   stream:  stream used for async dispatch
+    //   synchronize: if true, waits for completion before returning
     //
     // On return, every hole pixel in frame holds a smoothly interpolated color
     // derived from nearby valid pixels.
-    void fill(CUarray frame, CUarray holeMap, CUstream stream = nullptr);
+    void fill(CUarray frame, CUarray holeMap, CUstream stream = nullptr, bool synchronize = true);
 
 private:
     void destroy() noexcept;
