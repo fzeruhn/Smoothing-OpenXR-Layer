@@ -4,7 +4,7 @@ This roadmap replaces the old item-by-item sequence with a phased execution plan
 
 Critical architecture constraints are baked in:
 - This project builds an **OpenXR API layer DLL**, **not** `openxr_loader.dll`.
-- OpenXR frame pacing is strict (`xrWaitFrame -> xrBeginFrame -> xrEndFrame`), so dual-submit/FG pacing must be treated as a dedicated architecture phase, not a quick extension of single-submit rewrite.
+- OpenXR frame pacing is strict (`xrWaitFrame -> xrBeginFrame -> xrEndFrame`), so asynchronous presentation must be implemented as a dedicated decoupled architecture phase, not as naive dual-submit from one app frame.
 
 ---
 
@@ -89,26 +89,44 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 
 ---
 
-## Phase 3 — Timing Semantics Validation (Decoupled Presentation & Asynchronous Submission.)
+## Phase 3 — Decoupled Runtime Pacing Architecture (Asynchronous Presentation)
 
-**Objective:** Validate runtime-compliant pacing semantics before enabling any 45->90 behavior.
+**Objective:** Replace failed dual-submit assumptions with a runtime-compliant decoupled model that owns headset-rate pacing on a dedicated layer thread.
 
 ### Tasks
-1. Stabilize **single-submit rewritten path** first.
-2. Add instrumentation:
+1. Implement an **independent runtime submission thread** in the layer that continuously drives:
+   - `xrWaitFrame -> xrBeginFrame -> xrEndFrame`
+   - one runtime submit opportunity per runtime cadence tick.
+2. Keep the **application thread unthrottled**:
+   - do not artificially block app-facing `xrWaitFrame`
+   - map app-produced frames to the next eligible predicted display time in layer-managed state.
+3. Implement the **Holding Pen (ring buffer)** in `FrameBroker`:
+   - on app `xrEndFrame`, capture frame payload + timing metadata into a bounded queue
+   - return `XR_SUCCESS` to app without immediately forwarding submit to runtime thread path.
+4. Implement runtime-thread **dynamic decision policy** at each submit deadline:
+   - Path A (on-time): if a fresh app frame is queued, submit it unmodified
+   - Path B (deadline miss): synthesize from buffered history and submit synthetic output.
+5. Implement **fractional Δt motion scaling**:
+   - compute scaling from source frame timestamps to runtime target `predictedDisplayTime`
+   - feed scaled vectors/pose-warp inputs into synthesis path.
+6. Add pacing instrumentation:
    - app `predictedDisplayTime`
-   - synthesis completion timestamp
-   - actual submission timestamp
-3. Prototype dual-submit behavior behind runtime flag **only after single-submit stability**.
-4. Implement a buffering strategy in FrameBroker to hold N past frames. Calculate fractional motion vector scaling based on Δt between the buffered frames and the target predictedDisplayTime.
-4. Validate runtime acceptance/compositor stability/frame pacing under that mode.
+   - app frame enqueue time
+   - runtime thread `predictedDisplayTime`
+   - synthesis completion time
+   - actual runtime submit time.
+7. Validate runtime acceptance/compositor stability under decoupled mode, including queue pressure, stale-frame behavior, and fallback correctness.
 
-### Critical Note
-Naive “two submits from one app frame” is likely non-compliant for many runtimes. Treat dual-submit as experimental and heavily gated until proven runtime-safe.
+### Critical Notes
+- Dual-submit from a single app frame is now considered a rejected approach for this project path.
+- The runtime thread must remain OpenXR-order compliant and avoid illegal overlap/reentrancy across frame loops.
+- Ring buffer policy must be explicit (drop-oldest vs drop-newest) and observable via tracing.
 
 ### Exit Criteria
-- Single-submit path production-stable.
-- Dual-submit behavior characterized and gated by runtime compatibility.
+- Dedicated runtime submission loop is stable at headset cadence.
+- App thread remains unblocked and no longer directly dictates runtime submission cadence.
+- On-time path and synthesis fallback path both produce stable output without runtime state/validation errors.
+- Fractional Δt scaling is active and trace-verified under variable app framerate.
 
 ---
 
@@ -141,7 +159,7 @@ Naive “two submits from one app frame” is likely non-compliant for many runt
    - `passthrough`
    - `injection-copy`
    - `full-synthesis`
-   - optional `dual-submit` (gated).
+   - `decoupled-runtime-thread` (gated)
 4. Lock test logging profile categories:
    - depth
    - fences/sync
@@ -180,7 +198,7 @@ Naive “two submits from one app frame” is likely non-compliant for many runt
 
 1. Item 10 lifecycle + rewrite completion.
 2. Full live GPU stage wiring.
-3. Timing semantics validation (single-submit first, dual-submit optional/gated).
+3. Decoupled runtime pacing architecture (independent runtime thread + buffered/synth fallback).
 4. Depth/pose correctness.
 5. Packaging + in-game execution.
 
@@ -198,4 +216,3 @@ Naive “two submits from one app frame” is likely non-compliant for many runt
 - `openxr-api-layer/ofa_pipeline.h/.cpp`
 - `openxr-api-layer/stereo_vector_adapter.h/.cu`
 - `openxr-api-layer/hole_filler.h/.cu`
-
