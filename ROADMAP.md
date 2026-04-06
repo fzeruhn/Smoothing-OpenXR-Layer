@@ -45,7 +45,7 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 
 ---
 
-## Phase 1 — Complete Item 10 Core Submission Path (Single-Submit First)
+## Phase 1 — Complete Item 10 Core Submission Path (Single-Submit First) | Complete ✅
 
 **Objective:** Finish safe synthetic swapchain submission pipeline with one rewritten submit per app frame.
 
@@ -71,7 +71,7 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 
 ---
 
-## Phase 2 — GPU Pipeline Wiring Completion (`VulkanFrameProcessor`)
+## Phase 2 — GPU Pipeline Wiring Completion (`VulkanFrameProcessor`) | Complete ✅
 
 **Objective:** Complete the live synthesis chain actually consumed by Phase 1 submission rewrite.
 
