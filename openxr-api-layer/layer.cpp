@@ -28,8 +28,10 @@
 #include "depth_provider.h"
 #include "frame_broker.h"
 #include "frame_context.h"
+#include "frame_injection.h"
 #include "holding_pen.h"
 #include "pose_provider.h"
+#include "runtime_thread.h"
 #include <log.h>
 #include <util.h>
 #include <algorithm>
@@ -372,6 +374,55 @@ namespace openxr_api_layer {
                             Log("[HoldingPen] Initialization failed\n");
                         }
                     }
+
+                    // Ensure injection swapchain exists (guard prevents re-entrant creation)
+                    if (!FrameInjection::IsCreatingSwapchain()) {
+                        m_frameInjection.EnsureSwapchain(*this, session, m_frameBroker);
+                        if (m_frameInjection.IsReady() && m_injectionVulkanImages.empty()) {
+                            uint32_t count = 0;
+                            if (XR_SUCCEEDED(OpenXrApi::xrEnumerateSwapchainImages(
+                                    m_frameInjection.Swapchain(), 0, &count, nullptr)) && count > 0) {
+                                std::vector<XrSwapchainImageVulkanKHR> imgs(
+                                    count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+                                if (XR_SUCCEEDED(OpenXrApi::xrEnumerateSwapchainImages(
+                                        m_frameInjection.Swapchain(), count, &count,
+                                        reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data())))) {
+                                    for (auto& img : imgs) {
+                                        m_injectionVulkanImages.push_back(img.image);
+                                    }
+                                    Log(fmt::format("[FrameInjection] Mapped {} injection images\n", count));
+                                }
+                            }
+                        }
+                    }
+
+                    // Start RuntimeThread once holding pen + injection swapchain are both ready
+                    if (!m_runtimeThread && m_holdingPen.IsInitialized() &&
+                        m_frameInjection.IsReady() && !m_injectionVulkanImages.empty()) {
+                        RuntimeThread::Config cfg{};
+                        cfg.api                     = this;
+                        cfg.session                 = m_session;
+                        cfg.injectionSwapchain      = m_frameInjection.Swapchain();
+                        cfg.injectionImages         = m_injectionVulkanImages;
+                        cfg.device                  = m_vkDevice;
+                        cfg.physDevice              = m_vkPhysicalDevice;
+                        cfg.queue                   = m_vkQueue;
+                        cfg.queueMutex              = &m_queueMutex;
+                        cfg.queueFamilyIndex        = m_vkQueueFamilyIndex;
+                        cfg.width                   = m_frameBroker.GetSwapchainWidth();
+                        cfg.height                  = m_frameBroker.GetSwapchainHeight();
+                        cfg.holdingPen              = &m_holdingPen;
+                        cfg.xrWaitSwapchainImage    = m_xrWaitSwapchainImage;
+                        cfg.xrReleaseSwapchainImage = m_xrReleaseSwapchainImage;
+
+                        m_runtimeThread = std::make_unique<RuntimeThread>();
+                        if (!m_runtimeThread->Start(std::move(cfg))) {
+                            Log("[OpenXrLayer] Failed to start RuntimeThread\n");
+                            m_runtimeThread.reset();
+                        } else {
+                            Log("[OpenXrLayer] RuntimeThread started\n");
+                        }
+                    }
                 } else if (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) {
                     m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
                     Log(fmt::format("Intercepted Depth Swapchain: {}x{}\n", createInfo->width, createInfo->height));
@@ -409,8 +460,20 @@ namespace openxr_api_layer {
         }
 
         XrResult xrWaitFrame(XrSession session, const XrFrameWaitInfo* frameWaitInfo, XrFrameState* frameState) override {
+            if (session == m_session && m_runtimeThread && m_runtimeThread->IsRunning()) {
+                // Runtime thread owns the real xrWaitFrame; give app thread a synthetic frame state.
+                XrFrameState synth{XR_TYPE_FRAME_STATE};
+                if (m_runtimeThread->GetSynthesizedFrameState(synth)) {
+                    *frameState = synth;
+                    m_poseProvider.OnWaitFrame(synth);
+                    TraceLoggingWrite(g_traceProvider, "xrWaitFrame_Synthesized",
+                                      TLArg(synth.predictedDisplayTime, "DisplayTime"));
+                    return XR_SUCCESS;
+                }
+                // No data yet (first couple frames) — fall through to real call below.
+            }
             XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
-            if (XR_SUCCEEDED(result) && session == m_session && frameState && frameState->type == XR_TYPE_FRAME_STATE) {
+            if (XR_SUCCEEDED(result) && session == m_session && frameState) {
                 m_poseProvider.OnWaitFrame(*frameState);
             }
             return result;
@@ -490,18 +553,31 @@ namespace openxr_api_layer {
                 }
             } // end if (session == m_session && Vulkan)
 
-            // Phase 3: pass-through. Runtime thread will own submission in Step B+.
+            // When runtime thread is running, app's xrEndFrame stops here.
+            if (m_runtimeThread && m_runtimeThread->IsRunning()) {
+                TraceLoggingWrite(g_traceProvider, "xrEndFrame_AppIntercepted",
+                                  TLArg(true, "RuntimeThreadOwns"));
+                return XR_SUCCESS;  // Do NOT forward — runtime thread owns compositor submission.
+            }
             return OpenXrApi::xrEndFrame(session, frameEndInfo);
         }
 
         XrResult xrBeginFrame(XrSession session, const XrFrameBeginInfo* frameBeginInfo) override {
-            // Phase 3 Step B will intercept this when the runtime thread is active.
+            if (session == m_session && m_runtimeThread && m_runtimeThread->IsRunning()) {
+                // Runtime thread owns xrBeginFrame; app thread call is a no-op.
+                return XR_SUCCESS;
+            }
             return OpenXrApi::xrBeginFrame(session, frameBeginInfo);
         }
 
         XrResult xrDestroySession(XrSession session) override {
             if (session == m_session) {
-                // Phase 3 Step B will stop the runtime thread here.
+                if (m_runtimeThread) {
+                    Log("[OpenXrLayer] Stopping RuntimeThread on session destroy\n");
+                    m_runtimeThread->Stop();
+                    m_runtimeThread.reset();
+                }
+                m_holdingPen.Shutdown();
                 m_session = XR_NULL_HANDLE;
             }
             return OpenXrApi::xrDestroySession(session);
@@ -556,6 +632,11 @@ namespace openxr_api_layer {
         HoldingPen m_holdingPen;
         std::mutex m_queueMutex;   // Serializes vkQueueSubmit between app and runtime threads
         VkQueue    m_vkQueue{VK_NULL_HANDLE};
+
+        // Phase 3: runtime thread + injection swapchain
+        std::unique_ptr<RuntimeThread> m_runtimeThread;
+        FrameInjection                 m_frameInjection;
+        std::vector<VkImage>           m_injectionVulkanImages;
 
         // Per-eye FOV data (extracted from xrEndFrame projection layers)
         XrFovf m_fovLeft{};
