@@ -28,6 +28,7 @@
 #include "depth_provider.h"
 #include "frame_broker.h"
 #include "frame_context.h"
+#include "holding_pen.h"
 #include "pose_provider.h"
 #include <log.h>
 #include <util.h>
@@ -352,6 +353,25 @@ namespace openxr_api_layer {
                 if (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) {
                     m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
                     Log(fmt::format("Intercepted Color Swapchain: {}x{}\n", createInfo->width, createInfo->height));
+
+                    // Capture queue once on first color swapchain
+                    if (m_vkQueue == VK_NULL_HANDLE && m_vkDevice != VK_NULL_HANDLE) {
+                        vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &m_vkQueue);
+                    }
+
+                    // Initialize holding pen once (use the app swapchain format/dimensions)
+                    if (!m_holdingPen.IsInitialized() && m_vkDevice != VK_NULL_HANDLE && m_vkQueue != VK_NULL_HANDLE) {
+                        const VkFormat penFormat = static_cast<VkFormat>(createInfo->format);
+                        if (m_holdingPen.Initialize(m_vkDevice, m_vkPhysicalDevice,
+                                                    createInfo->width, createInfo->height,
+                                                    penFormat, m_vkQueueFamilyIndex)) {
+                            Log(fmt::format("[HoldingPen] Ready for {}x{} fmt={}\n",
+                                            createInfo->width, createInfo->height,
+                                            static_cast<int>(penFormat)));
+                        } else {
+                            Log("[HoldingPen] Initialization failed\n");
+                        }
+                    }
                 } else if (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) {
                     m_frameBroker.RegisterSwapchain(*swapchain, *createInfo);
                     Log(fmt::format("Intercepted Depth Swapchain: {}x{}\n", createInfo->width, createInfo->height));
@@ -444,6 +464,30 @@ namespace openxr_api_layer {
                 // Phase 3: pass-through only. No synthesis, no rewrite, no CUDA.
                 TraceLoggingWrite(g_traceProvider, "xrEndFrame_PassThrough",
                                   TLArg(frameEndInfo ? frameEndInfo->layerCount : 0u, "LayerCount"));
+
+                // Phase 3 Step A: copy current color image into holding pen slot.
+                // Pass-through to OpenXR still happens below — runtime thread not yet running.
+                if (m_holdingPen.IsInitialized() && projectionLayer != nullptr) {
+                    VkImage currentColor = m_frameBroker.GetCurrentColorImage();
+                    if (currentColor != VK_NULL_HANDLE) {
+                        m_holdingPen.PollSlots();
+                        const int32_t slot = m_holdingPen.AcquireIdleSlot();
+                        if (slot >= 0) {
+                            const XrTime displayTime = m_poseProvider.GetLastPredictedDisplayTime();
+                            const bool copied = m_holdingPen.SubmitCopy(
+                                slot, currentColor,
+                                m_frameBroker.GetSwapchainWidth(), m_frameBroker.GetSwapchainHeight(),
+                                displayTime, m_vkQueue, m_queueMutex);
+                            TraceLoggingWrite(g_traceProvider, "HoldingPen_Copy",
+                                              TLArg(slot, "Slot"),
+                                              TLArg(copied, "Submitted"),
+                                              TLArg(m_holdingPen.GetDebugState().c_str(), "State"));
+                        } else {
+                            TraceLoggingWrite(g_traceProvider, "HoldingPen_NoSlot",
+                                              TLArg(m_holdingPen.GetDebugState().c_str(), "State"));
+                        }
+                    }
+                }
             } // end if (session == m_session && Vulkan)
 
             // Phase 3: pass-through. Runtime thread will own submission in Step B+.
@@ -507,6 +551,11 @@ namespace openxr_api_layer {
         VkDevice m_vkDevice{VK_NULL_HANDLE};
         uint32_t m_vkQueueFamilyIndex{0};
         uint32_t m_vkQueueIndex{0};
+
+        // Phase 3: holding pen + queue ownership
+        HoldingPen m_holdingPen;
+        std::mutex m_queueMutex;   // Serializes vkQueueSubmit between app and runtime threads
+        VkQueue    m_vkQueue{VK_NULL_HANDLE};
 
         // Per-eye FOV data (extracted from xrEndFrame projection layers)
         XrFovf m_fovLeft{};

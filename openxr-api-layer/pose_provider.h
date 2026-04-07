@@ -14,6 +14,8 @@ class PoseProvider {
                                     const XrCompositionLayerProjection& projectionLayer,
                                     FrameContext& frameContext) const;
 
+    XrTime GetLastPredictedDisplayTime() const { return m_lastPredictedDisplayTime; }
+
   private:
     XrTime m_lastPredictedDisplayTime{0};
 };
