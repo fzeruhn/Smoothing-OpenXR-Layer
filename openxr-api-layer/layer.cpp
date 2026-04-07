@@ -414,6 +414,17 @@ namespace openxr_api_layer {
                         cfg.holdingPen              = &m_holdingPen;
                         cfg.xrWaitSwapchainImage    = m_xrWaitSwapchainImage;
                         cfg.xrReleaseSwapchainImage = m_xrReleaseSwapchainImage;
+                        // Bind base-class methods directly so the runtime thread bypasses
+                        // OpenXrLayer virtual overrides and reaches the real compositor.
+                        cfg.waitFrame  = [this](XrSession s, const XrFrameWaitInfo* w, XrFrameState* f) {
+                            return OpenXrApi::xrWaitFrame(s, w, f);
+                        };
+                        cfg.beginFrame = [this](XrSession s, const XrFrameBeginInfo* b) {
+                            return OpenXrApi::xrBeginFrame(s, b);
+                        };
+                        cfg.endFrame   = [this](XrSession s, const XrFrameEndInfo* e) {
+                            return OpenXrApi::xrEndFrame(s, e);
+                        };
 
                         m_runtimeThread = std::make_unique<RuntimeThread>();
                         if (!m_runtimeThread->Start(std::move(cfg))) {

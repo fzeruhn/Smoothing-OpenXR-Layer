@@ -4,6 +4,7 @@
 #include <openxr/openxr.h>
 #include <thread>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <vector>
 #include <cstdint>
@@ -33,9 +34,14 @@ class RuntimeThread {
         uint32_t                height{0};
         // Holding pen (shared with app thread)
         HoldingPen*             holdingPen{nullptr};
-        // OpenXR function pointers
+        // OpenXR function pointers for swapchain management
         PFN_xrWaitSwapchainImage    xrWaitSwapchainImage{nullptr};
         PFN_xrReleaseSwapchainImage xrReleaseSwapchainImage{nullptr};
+        // Direct compositor calls — MUST be bound to OpenXrApi base class methods,
+        // NOT virtual overrides, so the runtime thread bypasses layer intercepts.
+        std::function<XrResult(XrSession, const XrFrameWaitInfo*, XrFrameState*)> waitFrame;
+        std::function<XrResult(XrSession, const XrFrameBeginInfo*)>               beginFrame;
+        std::function<XrResult(XrSession, const XrFrameEndInfo*)>                 endFrame;
     };
 
     // Start the runtime thread. Returns false if config is invalid.

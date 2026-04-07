@@ -104,7 +104,7 @@ void RuntimeThread::ThreadMain() {
         XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState    frameState{XR_TYPE_FRAME_STATE};
         const XrResult waitResult =
-            m_config.api->xrWaitFrame(m_config.session, &waitInfo, &frameState);
+            m_config.waitFrame(m_config.session, &waitInfo, &frameState);
         if (XR_FAILED(waitResult)) {
             Log(fmt::format("[RuntimeThread] xrWaitFrame failed: {}\n",
                             static_cast<int>(waitResult)));
@@ -132,7 +132,7 @@ void RuntimeThread::ThreadMain() {
         // ── Step 2: begin frame ────────────────────────────────────────────
         XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
         const XrResult beginResult =
-            m_config.api->xrBeginFrame(m_config.session, &beginInfo);
+            m_config.beginFrame(m_config.session, &beginInfo);
         if (XR_FAILED(beginResult) && beginResult != XR_FRAME_DISCARDED) {
             Log(fmt::format("[RuntimeThread] xrBeginFrame failed: {}\n",
                             static_cast<int>(beginResult)));
@@ -176,7 +176,7 @@ void RuntimeThread::SubmitEmptyFrame(XrTime displayTime) {
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     endInfo.layerCount           = 0;
     endInfo.layers               = nullptr;
-    const XrResult result = m_config.api->xrEndFrame(m_config.session, &endInfo);
+    const XrResult result = m_config.endFrame(m_config.session, &endInfo);
 
     TraceLoggingWrite(g_traceProvider, "RuntimeThread_EmptyFrame",
                       TLArg(displayTime, "DisplayTime"),
