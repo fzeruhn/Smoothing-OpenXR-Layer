@@ -311,6 +311,7 @@ copy $(SolutionDir)\scripts\Uninstall-Layer32.ps1 $(OutDir)
     <ClCompile Include="framework\log.cpp" />
     <ClCompile Include="depth_provider.cpp" />
     <ClCompile Include="frame_broker.cpp" />
+    <ClCompile Include="holding_pen.cpp" />
     <ClCompile Include="frame_injection.cpp" />
     <ClCompile Include="layer.cpp" />
     <ClCompile Include="ofa_pipeline.cpp">
