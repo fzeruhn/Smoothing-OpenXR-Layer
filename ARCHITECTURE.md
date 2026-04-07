@@ -1,6 +1,6 @@
 # Architecture: OpenXR Motion Smoothing Layer
 
-## Pipeline Overview
+## Pipeline Overview (Current Direction)
 
 ```
 App (Star Citizen / Vulkan)
@@ -9,42 +9,64 @@ App (Star Citizen / Vulkan)
 ┌─────────────────────────────────────────────┐
 │           OpenXR API Layer (this project)   │
 │                                             │
-│  ┌─ App Thread ────────────────────────┐    │
-│  │  Frame Capture:                     │    │
-│  │  color[L,R], depth[L,R],            │    │
-│  │  pose_render, pose_display, timing  │    │
-│  │           │                         │    │
-│  │           ▼                         │    │
-│  │  True Holding Pen (deep copy):      │    │
-│  │  vkCmdCopyImage → layer-owned image │    │
-│  │  (binary semaphore signals ready)   │    │
-│  │           │                         │    │
-│  │  Return XR_SUCCESS immediately ◄────┘    │
+│  ┌─ Frame Capture ──────────────────────┐   │
+│  │  color[L,R], depth[L,R],             │   │
+│  │  pose_render, pose_display, timing   │   │
 │  └──────────────────────────────────────┘   │
-│                                             │
-│  ┌─ Runtime Thread ────────────────────┐    │
-│  │  xrWaitFrame / xrBeginFrame         │    │
-│  │           │                         │    │
-│  │  Decision: on-time or deadline miss?│    │
-│  │     │                    │          │    │
-│  │     ▼                    ▼          │    │
-│  │  Path A:             Path B:        │    │
-│  │  Submit fresh        Synthesize:    │    │
-│  │  held frame          pre-warp →     │    │
-│  │                      OFA → stereo   │    │
-│  │                      → synthesis    │    │
-│  │                      → hole fill    │    │
-│  │           │                         │    │
-│  │           ▼                         │    │
-│  │  xrEndFrame (layer-owned images)    │    │
+│          │                                  │
+│          ▼                                  │
+│  ┌─ 6DoF Pre-warp ──────────────────────┐   │
+│  │  Apply pose delta to frame N         │   │
+│  │  Remove global head-motion before    │   │
+│  │  OFA — isolates scene-relative flow  │   │
+│  └──────────────────────────────────────┘   │
+│          │                                  │
+│          ▼                                  │
+│  ┌─ OFA Motion Vectors (left eye) ──────┐   │
+│  │  Vulkan→CUDA interop                 │   │
+│  │  NVOf SDK 5.0.7                      │   │
+│  │  Output: dense vector grid (4×4 px)  │   │
+│  └──────────────────────────────────────┘   │
+│          │                                  │
+│          ▼                                  │
+│  ┌─ Stereo Vector Adaptation ───────────┐   │
+│  │  Project left-eye vectors to right   │   │
+│  │  eye via IPD offset                  │   │
+│  └──────────────────────────────────────┘   │
+│          │                                  │
+│          ▼                                  │
+│  ┌─ Bidirectional Frame Warp ───────────┐   │
+│  │  Forward warp: frame N → T+0.5       │   │
+│  │  Backward warp: frame N+1 → T+0.5    │   │
+│  │  Depth-guided blend + occlusion map  │   │
+│  │  Output: synth frame + hole map      │   │
+│  └──────────────────────────────────────┘   │
+│          │                                  │
+│          ▼                                  │
+│  ┌─ Hole Filling ───────────────────────┐   │
+│  │  Math inpainting on hole map pixels  │   │
+│  │  (swappable AI slot)                 │   │
+│  └──────────────────────────────────────┘   │
+│          │                                  │
+│  ┌─ Queue Isolation + Holding Pen ──────┐   │
+│  │  App stays on Queue 0                │   │
+│  │  Runtime/compositor moved to Queue 1 │   │
+│  │  Deep-copy app frame to layer image  │   │
+│  └──────────────────────────────────────┘   │
+│          │                                  │
+│          ▼                                  │
+│  ┌─ Decoupled Runtime Thread ───────────┐   │
+│  │  Owns xrWaitFrame/Begin/End cadence  │   │
+│  │  Path A: submit queued real frame    │   │
+│  │  Path B: synth fallback on deadline  │   │
 │  └──────────────────────────────────────┘   │
 └─────────────────────────────────────────────┘
         │
-        ▼  xrEndFrame (layer-owned color/depth)
-OpenXR Runtime / Compositor (PimaxXR / SteamVR)
+        ▼  xrEndFrame (modified layer info)
+OpenXR Runtime / Compositor (PimaxXR)
 ```
 
-**LSR Fallback** (parallel path): if app misses deadline, skip synthesis and apply pose-only reprojection to last good frame before submission.
+**Safety fallback:** If capability gates fail (no controlled Vulkan path/queue redirect), the layer forces passthrough and does not start decoupled submission.
 
 ---
 
@@ -133,25 +155,21 @@ fill(VkImage frame, VkImage hole_map) -> VkImage filled_frame
 
 ---
 
-## System 5: Dynamic Frame Rate Targeting
+## System 5: Decoupled Runtime Pacing (Color-Only First)
 
-**Purpose:** Inject the correct number of synthetic frames to hit target display rate regardless of app native FPS.
+**Purpose:** Keep runtime submission at headset cadence while the app thread runs unthrottled.
 
 **Target rate:** Native panel refresh (90Hz for Pimax Dream Air). Configurable.
 
-**Bypass mode:** If app native FPS >= target rate, the synthesis pipeline is skipped entirely. Zero overhead in this case.
+**Phase 3A behavior (color-only):** No depth chains, no mandatory synthesis. Submit newest queued real frame when available.
 
-**Injection ratios:**
-| App FPS | Target FPS | Synthetics per real frame |
-|---|---|---|
-| 45 | 90 | 1 |
-| 30 | 90 | 2 |
-| 60 | 90 | 0 or 1 (alternating) |
-| 72 | 90 | 0 or 1 (staggered 1-in-4) |
+**Phase 3B behavior:** If deadline is missed and no fresh real frame exists, synthesize from recent layer-owned color frames.
 
-**Non-integer ratios** require a frame pacing buffer: a ring buffer of `(display_timestamp, frame_type: real|synthetic)` entries. The pacing logic determines when to inject a synthetic frame based on timestamp gaps, avoiding judder at fractional ratios.
+**Holding pen:** Bounded ring buffer of layer-owned copied color images + timestamps. Never pass raw app-owned image pointers across thread boundary.
 
-**Frame timing measurement:** Track `xrEndFrame` call intervals (rolling average over last 8 frames) to estimate app native FPS.
+**Fractional Δt scaling:** motion vectors and pose warp must be scaled to runtime target `predictedDisplayTime` using actual buffered frame timestamps.
+
+**Queue model:** app rendering remains on Queue 0; runtime/compositor submission uses Queue 1 after OpenXR negotiation/session interception.
 
 ---
 
@@ -187,40 +205,19 @@ This is the safety net that prevents judder from propagating to the user. It sha
 
 ---
 
-## Frame Submission & Decoupled Runtime Thread
+## Frame Submission
 
-**EAC-Safe Architecture:** The layer operates entirely within the OpenXR API boundary. There is **no Vulkan API interception** (no `vkCreateDevice` hook, no `vkCmdPipelineBarrier` injection). This ensures compatibility with Easy Anti-Cheat and avoids Vulkan companion layer complexity.
+**Purpose:** Deliver real or synthesized layer-owned frames to the downstream runtime from the decoupled runtime thread.
 
-### True Holding Pen (Layer-Owned Images)
+**Mechanism:** App thread captures and deep-copies frame data; runtime thread performs the actual downstream `xrEndFrame` calls at runtime cadence with layer-owned images.
 
-The layer allocates a private ring buffer of Vulkan color images (and later depth images) that it fully owns. When the app calls `xrEndFrame`, the layer:
-1. Issues `vkCmdCopyImage` (or a compute-shader copy) from the app's swapchain image into the next available layer-owned image.
-2. Records the frame's predicted display time and pose metadata alongside the copied image.
-3. Returns `XR_SUCCESS` to the app immediately — the app thread is never throttled by compositor pacing.
+**Synthetic frame swapchain:** A separate VkSwapchainKHR (or XrSwapchain) must be created by the layer to hold synthetic frame output. This is allocated at session creation time with appropriate usage flags for compute write + composition source.
 
-Only layer-owned images ever cross the app-thread/runtime-thread boundary. The app's Vulkan memory is never touched by the runtime thread.
-
-### Thread Synchronization: Binary Semaphores + Fences
-
-Timeline semaphores are **not used**. Thread-crossing synchronization relies exclusively on:
-- **Binary `VkSemaphore`** — for GPU-side ordering between the copy command and the runtime-thread submission.
-- **`VkFence`** — for CPU-side readiness checks before re-recording or re-using a ring slot.
-
-This keeps the synchronization model simple, maximally compatible, and auditable.
-
-### Decoupled Runtime Thread
-
-A dedicated thread owns the full `xrWaitFrame -> xrBeginFrame -> xrEndFrame` loop to the compositor:
-- **Path A (on-time):** Submit the freshest layer-owned copied frame.
-- **Path B (deadline miss):** Synthesize from the layer-owned buffer using fractional Δt motion scaling and submit the synthesized result.
-
-The runtime thread never accesses application memory. Shutdown calls `vkQueueWaitIdle` or `vkDeviceWaitIdle` to drain in-flight work before freeing layer-owned images.
-
-### Phase 3 Color-Only Constraint
-
-During Phase 3 stabilization, all `XrCompositionLayerDepthInfoKHR` chains are stripped before submission. Depth is re-introduced in Phase 4 after the binary sync and deep-copy logic is proven correct in color-only mode.
-
----
+**Complexity notes:**
+- Swapchain images must be in `XR_SWAPCHAIN_IMAGE_LAYOUT_COLOR_OPTIMAL` before submission.
+- Runtime thread must preserve strict frame order (`xrWaitFrame -> xrBeginFrame -> xrEndFrame`).
+- Queue isolation is mandatory before asynchronous submission; no Vulkan submit/present detours.
+- On `xrDestroySession`, stop runtime thread, idle queue/device, then free layer-owned images.
 
 ---
 
@@ -228,9 +225,9 @@ During Phase 3 stabilization, all `XrCompositionLayerDepthInfoKHR` chains are st
 
 | Question | Impact | Status |
 |---|---|---|
-| Depth source for Star Citizen | Required for full-quality warp (Phase 4) | Research needed |
+| Depth source for Star Citizen | Required for full-quality warp | Research needed |
 | OFA latency on RTX 5070 Ti | Must fit ~4-5ms of ~11ms budget | Profile on hardware |
 | Eye tracking OpenXR extension for Pimax Dream Air | Foveated processing | Confirm at integration |
 | IPD-based stereo vector adaptation accuracy | Right-eye synthesis quality | Validate empirically |
-| Binary semaphore ring sizing (color holding pen) | Frame pacing stability | Tune at Phase 3 integration |
-| Depth image format compatibility with compositor | Phase 4 depth chain reintegration | Validate at Phase 4 |
+| Queue-index redirect compatibility across runtimes | Decoupled submission stability | Validate on SteamVR/PimaxXR |
+| Layer-owned image lifetime + teardown ordering | Avoid vkFreeMemory-in-use failures | Validate in shutdown stress |

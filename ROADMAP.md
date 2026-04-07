@@ -89,54 +89,95 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 
 ---
 
-## Phase 3 — Decoupled Runtime Pacing & Owned-Resource Architecture
+## Phase 3 — Decoupled Runtime Pacing with Total Resource Ownership
 
-**Objective:** Replace failed dual-submit and metadata assumptions with a fully isolated OpenXR layer that owns its own Vulkan memory and synchronizes via EAC-safe binary primitives.
+**Objective:** Replace failed metadata-queue assumptions with a controlled architecture where the layer owns synchronization guarantees and cross-thread image lifetime.
 
-### Tasks
-1. **Implement EAC-Safe Synchronization:**
-   - Rip out all `timelineSemaphore` dependencies.
-   - Implement thread-crossing synchronization using strict **Binary Semaphores** and **Vulkan Fences**.
-2. **Implement the "True Holding Pen" (Layer-Owned Images):**
-   - Allocate a private ring buffer of layer-owned Vulkan color images.
-   - On app `xrEndFrame`, execute a deep copy (`vkCmdCopyImage` or compute shader) from the app's swapchain into the layer's private image.
-   - Return `XR_SUCCESS` to the app immediately, leaving the app thread unthrottled.
-3. **Implement the Independent Runtime Submission Thread:**
-   - Runtime thread owns the `xrWaitFrame -> xrBeginFrame -> xrEndFrame` loop to the compositor.
-   - The thread only ever submits **layer-owned copied images**, completely isolating SteamVR from the application's memory state.
-4. **Enforce Color-Only Decoupling (Phase 3 Stabilization):**
-   - Strip all `XrCompositionLayerDepthInfoKHR` chains during this phase.
-   - Accept external depth-barrier validation spam temporarily, knowing the compositor path is isolated and safe.
-5. **Implement Runtime-Thread Decision Policy & Synthesis:**
-   - Path A (on-time): Submit the freshest copied frame.
-   - Path B (deadline miss): Synthesize from the layer-owned buffer using fractional Δt motion scaling.
-6. **Graceful Teardown:**
-   - On shutdown, ensure `vkDeviceWaitIdle` or `vkQueueWaitIdle` is called to drain binary semaphores before freeing the layer's private images.
+### Phase 3A — Color-Only Decoupled Runtime Thread (No Synthesis Yet)
 
-### Exit Criteria
-- Decoupled runtime loop is stable at headset cadence using binary sync primitives.
-- App thread remains unblocked.
-- SteamVR/Compositor receives valid, layer-owned color images without fatal crashes.
+**Objective:** Prove stable decoupled pacing first, with color-only forwarding and no depth complexity.
+
+#### Tasks
+1. Add a **Vulkan API companion interception prerequisite**:
+   - intercept `vkCreateDevice` to verify controllable Vulkan negotiation and establish binary semaphore/fence-compatible synchronization (no timeline-semaphore dependency)
+2. Add **hardware queue isolation (EAC-safe queue redirect)**:
+   - runtimes commonly share the app's `VkQueue`; decoupled compositor calls on a separate thread can collide with game draw submissions and crash
+   - do **not** detour raw Vulkan submit functions (`vkQueueSubmit`/`vkQueuePresentKHR`) and do not rely on CPU mutex serialization in the hot path
+   - intercept `xrCreateVulkanDeviceKHR` (or equivalent negotiation path), inspect `VkDeviceCreateInfo`, and request 2 graphics queues when only 1 is requested
+   - intercept `xrCreateSession`, inspect `XrGraphicsBindingVulkanKHR`, and rewrite `queueIndex` from `0` to `1` for runtime/compositor work.
+3. Add **capability gate + safe fallback** before starting decoupled mode:
+   - if Vulkan interception is unavailable, device creation path is not controllable, or required extensions/features are missing, force `passthrough` mode
+   - never start the decoupled runtime thread in an uncontrolled environment.
+4. Redefine the Holding Pen as **layer-owned images**, not metadata pointers:
+   - allocate private layer-owned Vulkan images for queued color frames
+   - on app `xrEndFrame`, issue `vkCmdCopyImage` (or equivalent compute copy) from app image into layer-owned image
+   - only copied layer-owned images are allowed to cross the app-thread/runtime-thread boundary.
+5. Implement dedicated runtime thread pacing loop:
+   - runtime thread owns `xrWaitFrame -> xrBeginFrame -> xrEndFrame`
+   - app thread remains unthrottled and enqueues copied color frames + timing metadata.
+6. Make Phase 3 explicitly **color-only**:
+   - strip or ignore `XrCompositionLayerDepthInfoKHR` chains in decoupled mode during 3A
+   - submit color-only projection layers until decoupled pacing is proven stable.
+7. Add **graceful synchronization teardown**:
+   - on `xrDestroySession`, stop runtime thread deterministically
+   - wait for queue/device idle (`vkQueueWaitIdle` or `vkDeviceWaitIdle`) before freeing layer-owned images
+   - prevent `vkFreeMemory while in use` during shutdown.
+8. Add instrumentation and observability:
+   - capability-gate decision reason
+   - app enqueue timestamp + frame id
+   - runtime predicted display time + submit timestamp
+   - queue depth and drop policy actions (drop-oldest/drop-newest).
+
+#### Exit Criteria
+- Decoupled runtime thread runs stably at headset cadence in color-only mode.
+- App thread stays unblocked and no runtime validation/state errors occur.
+- No use-after-free or memory-in-use teardown failures on session shutdown.
+- Capability-gate fallback reliably reverts to passthrough on unsupported paths.
+
+### Phase 3B — Synthesis-on-Demand in Decoupled Mode (Still Color-Only)
+
+**Objective:** Add gap-filling synthesis to the proven 3A pacing architecture without reintroducing depth complexity.
+
+#### Tasks
+1. Add runtime-thread deadline decision policy:
+   - Path A: submit fresh queued real frame when available
+   - Path B: synthesize from recent layer-owned color history when deadline would be missed.
+2. Implement **fractional Δt scaling** for motion vectors and pose warp:
+   - compute from buffered frame timestamps to runtime target `predictedDisplayTime`
+   - trace both raw and scaled Δt values for validation.
+3. Keep synthesis strictly color-only in 3B:
+   - no depth chain submission/re-attachment in this phase.
+4. Validate compositor behavior under mixed real/synthetic color-only submits.
+
+#### Exit Criteria
+- On-time and synthesis fallback paths are both stable in decoupled mode.
+- Fractional Δt scaling is active, traceable, and visually consistent under variable app framerate.
+- No regression in frame pacing or synchronization stability from 3A baseline.
 
 ---
 
 ## Phase 4 — Depth Ownership + Depth-Chain Reintegration
 
-**Objective:** Safely re-introduce depth data into the stable, decoupled Phase 3 pipeline.
+**Objective:** Add depth back only after Phase 3 color-only decoupled mode is production-stable.
 
 ### Tasks
-1. **Implement Layer-Owned Depth Holding Pen:**
-   - Allocate private `D32_SFLOAT` (or equivalent) Vulkan images.
-   - Deep-copy app depth data into layer-owned images concurrently with color data.
-2. **Sanitize & Re-attach Depth Chains:**
-   - Reconstruct valid `XrCompositionLayerDepthInfoKHR` chains pointing to *layer-owned* depth memory.
-   - Submit real and synthetic frames with the new depth payload.
-3. Validate depth convention correctness:
-   - reversed-Z handling, near/far linearization, and pose-delta direction.
+1. Implement layer-owned depth resource path:
+   - allocate private depth images compatible with runtime submission requirements
+   - deep-copy app depth (`D32_SFLOAT` and supported formats) into layer-owned depth images aligned with color holding-pen frames.
+2. Reinstate depth extension chains on layer-submitted frames:
+   - attach valid `XrCompositionLayerDepthInfoKHR` chains to real and synthetic submissions
+   - ensure chain lifetime ownership is fully inside layer-managed memory for call scope.
+3. Validate depth convention and correctness in decoupled mode:
+   - reversed-Z handling
+   - near/far linearization
+   - depth range consistency across real and synthetic paths.
+4. Validate pose-delta direction/sign in pre-warp with depth-enabled synthesis.
+5. Validate compositor/runtime behavior with depth-enabled decoupled submission.
 
 ### Exit Criteria
+- Depth chains are stable and valid on decoupled real/synthetic submissions.
 - No major parallax inversion/background drift.
-- Validation spam related to depth barriers is resolved or safely ignored by the compositor.
+- Near geometry (cockpit/interior) remains stable under head motion with depth enabled.
 
 ---
 
@@ -187,14 +228,16 @@ What is still missing: end-to-end in-game submission rewrite with real synthesiz
 ---
 
 ## Strict Priority Order
-*(Updated to reflect the new sequence)*
 
-1. **EAC-Safe Sync Swap:** Replace timeline semaphores with binary semaphores/fences.
-2. **True Holding Pen (Color):** Allocate layer-owned images and wire up the deep copy on `xrEndFrame`.
-3. **Decoupled Runtime Thread:** Spin up the pacing loop to submit the layer-owned images (Color-only).
-4. **Synthesis Fallback:** Wire up the motion smoothing on missed deadlines.
-5. **Depth Ownership:** Copy depth buffers and rebuild the extension chains (Phase 4).
-6. **Packaging + In-game Execution.**
+*(Updated to reflect the asynchronous queue isolation sequence)*
+
+1. EAC-safe sync swap: replace timeline semaphores with binary semaphores/fences.
+2. Hardware queue isolation: intercept OpenXR device/session creation to redirect runtime work to `queueIndex = 1`.
+3. True holding pen (color): allocate layer-owned images and wire VRAM-to-VRAM deep copy on `xrEndFrame`.
+4. Decoupled runtime thread: spin up pacing loop to submit layer-owned images (color-only) on isolated queue.
+5. Synthesis fallback: wire motion smoothing for missed deadlines.
+6. Depth ownership: copy depth buffers and rebuild extension chains (Phase 4).
+7. Packaging + in-game execution.
 
 ---
 
