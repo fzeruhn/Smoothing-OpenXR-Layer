@@ -106,6 +106,11 @@ namespace openxr_api_layer {
                                                                   uint32_t* bufferCountOutput,
                                                                   char* buffer);
 
+    // App-thread xrBeginFrame intercept: when RuntimeThread owns pacing, return
+    // XR_SUCCESS immediately (the RuntimeThread calls the real xrBeginFrame).
+    XrResult XRAPI_CALL xrBeginFrame_intercept(XrSession session,
+                                               const XrFrameBeginInfo* frameBeginInfo);
+
     class VulkanFrameProcessor {
       public:
         static constexpr uint32_t kCommandBufferRingSize = 3;
@@ -974,6 +979,10 @@ namespace openxr_api_layer {
                     *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetVulkanDeviceExtensionsKHR_intercept);
                     return XR_SUCCESS;
                 }
+                if (strcmp(name, "xrBeginFrame") == 0) {
+                    *function = reinterpret_cast<PFN_xrVoidFunction>(xrBeginFrame_intercept);
+                    return XR_SUCCESS;
+                }
             }
 
             XrResult result = m_bypassApiLayer ? m_xrGetInstanceProcAddr(instance, name, function)
@@ -1234,6 +1243,28 @@ namespace openxr_api_layer {
         }
 
         XrResult xrWaitFrame(XrSession session, const XrFrameWaitInfo* frameWaitInfo, XrFrameState* frameState) override {
+            // RuntimeThread calls this with g_isRuntimeThread=true — go straight to compositor.
+            if (g_isRuntimeThread) {
+                return OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            }
+
+            // App thread: if RuntimeThread owns pacing, synthesize XrFrameState immediately.
+            // This prevents two simultaneous real xrWaitFrame callers on the same session.
+            if (m_runtimeThread && session == m_session && frameState) {
+                const int64_t lastTime = m_runtimeThread->GetLastDisplayTime();
+                const int64_t period   = m_runtimeThread->GetDisplayPeriod();
+                if (lastTime != 0) {
+                    frameState->type                   = XR_TYPE_FRAME_STATE;
+                    frameState->next                   = nullptr;
+                    frameState->predictedDisplayTime   = lastTime + period;
+                    frameState->predictedDisplayPeriod = period;
+                    frameState->shouldRender           = XR_TRUE;
+                    m_poseProvider.OnWaitFrame(*frameState);
+                    return XR_SUCCESS;
+                }
+            }
+
+            // RuntimeThread not yet active (or no timing available yet) — real call.
             XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
             if (XR_SUCCEEDED(result) && session == m_session && frameState && frameState->type == XR_TYPE_FRAME_STATE) {
                 m_poseProvider.OnWaitFrame(*frameState);
@@ -1560,6 +1591,23 @@ namespace openxr_api_layer {
         //   4. Compute homography from pose delta and FOV (m_fovLeft/m_fovRight)
         //   5. Call m_poseWarper->warp() on m_prevColor before feeding to OFA
         // This will significantly improve OFA quality by removing camera motion from flow field.
+
+      public:
+        // Called by xrBeginFrame_intercept (free function below).
+        // When RuntimeThread is active, the app thread's xrBeginFrame is a noop —
+        // the RuntimeThread exclusively owns xrBeginFrame on the compositor.
+        XrResult xrBeginFrame_app(XrSession session, const XrFrameBeginInfo* /*info*/) {
+            if (m_runtimeThread && session == m_session) {
+                // RuntimeThread owns xrBeginFrame — app thread does nothing.
+                return XR_SUCCESS;
+            }
+            // RuntimeThread not yet active: call through (pre-Phase3 path, or shutdown).
+            if (m_xrBeginFrame) {
+                XrFrameBeginInfo info{XR_TYPE_FRAME_BEGIN_INFO};
+                return m_xrBeginFrame(session, &info);
+            }
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
     };
 
     XrResult XRAPI_CALL xrGetVulkanInstanceExtensionsKHR_intercept(XrInstance instance,
@@ -1584,6 +1632,15 @@ namespace openxr_api_layer {
             return XR_ERROR_RUNTIME_FAILURE;
         }
         return layer->xrGetVulkanDeviceExtensionsKHR(instance, systemId, bufferCapacityInput, bufferCountOutput, buffer);
+    }
+
+    XrResult XRAPI_CALL xrBeginFrame_intercept(XrSession session,
+                                               const XrFrameBeginInfo* frameBeginInfo) {
+        auto* layer = dynamic_cast<OpenXrLayer*>(GetInstance());
+        if (layer == nullptr) {
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
+        return layer->xrBeginFrame_app(session, frameBeginInfo);
     }
 
     // This method is required by the framework to instantiate your OpenXrApi implementation.
