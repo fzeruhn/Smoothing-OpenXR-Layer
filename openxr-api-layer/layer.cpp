@@ -40,6 +40,8 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <cuda.h>
 
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -62,6 +64,11 @@ namespace openxr_api_layer {
     // bypassing layer logic to prevent re-entrant frame capture or deadlocks.
     // Pattern mirrors FrameInjection::s_creatingSwapchain.
     thread_local bool g_isRuntimeThread = false;
+
+    // Mutex protecting the shared VkQueue. Most Vulkan apps expose only one queue,
+    // so both the app thread (HoldingPen copy submits) and the runtime thread
+    // (blit + presentation submits) must serialize their vkQueueSubmit calls.
+    std::mutex g_queueMutex;
 
     using namespace log;
 

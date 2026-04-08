@@ -291,6 +291,7 @@ copy $(SolutionDir)\scripts\Uninstall-Layer32.ps1 $(OutDir)
     <ClInclude Include="frame_context.h" />
     <ClInclude Include="frame_injection.h" />
     <ClInclude Include="holding_pen.h" />
+    <ClInclude Include="runtime_thread.h" />
     <ClInclude Include="gpu_pipeline_kernels.h" />
     <ClInclude Include="hole_filler.h" />
     <ClInclude Include="layer.h" />
@@ -314,6 +315,7 @@ copy $(SolutionDir)\scripts\Uninstall-Layer32.ps1 $(OutDir)
     <ClCompile Include="frame_broker.cpp" />
     <ClCompile Include="frame_injection.cpp" />
     <ClCompile Include="holding_pen.cpp" />
+    <ClCompile Include="runtime_thread.cpp" />
     <ClCompile Include="layer.cpp" />
     <ClCompile Include="ofa_pipeline.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

@@ -4,8 +4,12 @@
 #include <stdexcept>
 #include <string>
 #include <cstring>
+#include <mutex>
 
 namespace openxr_api_layer {
+
+// Defined in layer.cpp — protects the shared VkQueue used by both threads.
+extern std::mutex g_queueMutex;
 
 #define CHECK_VK(call)                                                             \
     do {                                                                           \
@@ -266,13 +270,17 @@ void HoldingPen::SubmitCopy(VkImage appColorImage,
     CHECK_VK(vkEndCommandBuffer(cmd));
 
     // Submit — signal copyDone binary semaphore. No CPU wait.
+    // Lock the shared queue mutex: the runtime thread may be submitting concurrently.
     VkSubmitInfo submitInfo{};
     submitInfo.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount   = 1;
     submitInfo.pCommandBuffers      = &cmd;
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores    = &s.copyDone;
-    CHECK_VK(vkQueueSubmit(m_appQueue, 1, &submitInfo, VK_NULL_HANDLE));
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        CHECK_VK(vkQueueSubmit(m_appQueue, 1, &submitInfo, VK_NULL_HANDLE));
+    }
 
     s.meta = {displayTime, renderPose};
     m_latestReadySlot.store(chosenSlot, std::memory_order_release);
@@ -301,7 +309,10 @@ void HoldingPen::MarkConsumed(int slotIndex) {
     // for the app thread to reuse.
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    vkQueueSubmit(m_appQueue, 1, &submitInfo, m_slots[slotIndex].consumed);
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        vkQueueSubmit(m_appQueue, 1, &submitInfo, m_slots[slotIndex].consumed);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +321,7 @@ void HoldingPen::MarkConsumed(int slotIndex) {
 
 void HoldingPen::DrainAndDestroy() {
     if (m_appQueue != VK_NULL_HANDLE) {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
         vkQueueWaitIdle(m_appQueue);
     }
     FreeResources();
