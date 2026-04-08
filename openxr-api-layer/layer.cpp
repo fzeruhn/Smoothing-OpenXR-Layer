@@ -57,6 +57,12 @@
 
 namespace openxr_api_layer {
 
+    // Thread-local flag set to true inside the RuntimeThread's std::thread body.
+    // When true, all OpenXR hook overrides fast-path to the downstream dispatch,
+    // bypassing layer logic to prevent re-entrant frame capture or deadlocks.
+    // Pattern mirrors FrameInjection::s_creatingSwapchain.
+    thread_local bool g_isRuntimeThread = false;
+
     using namespace log;
 
     // Vulkan result check for internal layer use (not to be confused with CHECK_XRCMD).
@@ -1177,6 +1183,11 @@ namespace openxr_api_layer {
         XrResult xrAcquireSwapchainImage(XrSwapchain swapchain,
                                          const XrSwapchainImageAcquireInfo* acquireInfo,
                                          uint32_t* index) override {
+            // RuntimeThread calls this on the synthetic swapchain — bypass layer logic
+            // to prevent re-entrant frame capture that would deadlock or corrupt state.
+            if (g_isRuntimeThread) {
+                return OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
+            }
             XrResult result = OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
             if (XR_SUCCEEDED(result)) {
                 m_frameBroker.OnAcquireSwapchainImage(swapchain, *index); // Remember this index for EndFrame
@@ -1194,6 +1205,11 @@ namespace openxr_api_layer {
 
         // 4. HOOK END FRAME (The trigger to copy the data)
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
+            // RuntimeThread calls xrEndFrame on the compositor's behalf — bypass layer
+            // logic entirely to avoid re-entrant frame capture or infinite recursion.
+            if (g_isRuntimeThread) {
+                return OpenXrApi::xrEndFrame(session, frameEndInfo);
+            }
             if (session == m_session && m_apiType == GraphicsAPI::Vulkan) {
                 m_frameContext = FrameContext{};
                 const XrCompositionLayerProjection* projectionLayer = nullptr;
