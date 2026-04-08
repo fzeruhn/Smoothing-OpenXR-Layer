@@ -29,6 +29,8 @@
 #include "frame_broker.h"
 #include "frame_context.h"
 #include "frame_injection.h"
+#include "holding_pen.h"
+#include "runtime_thread.h"
 #include "frame_synthesizer.h"
 #include "gpu_pipeline_kernels.h"
 #include "hole_filler.h"
@@ -1095,8 +1097,17 @@ namespace openxr_api_layer {
             XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
 
             if (XR_SUCCEEDED(result) && isSystemHandled(createInfo->systemId)) {
+                // If a previous session's Phase3 resources are still alive, tear them down first.
+                if (m_session != XR_NULL_HANDLE) {
+                    TeardownPhase3Resources();
+                }
                 m_session = *session;
                 Log(fmt::format("Captured VR Session: {}\n", (void*)m_session));
+
+                PFN_xrVoidFunction beginFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrBeginFrame", &beginFn))) {
+                    m_xrBeginFrame = reinterpret_cast<PFN_xrBeginFrame>(beginFn);
+                }
 
                 PFN_xrVoidFunction waitFn = nullptr;
                 if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrWaitSwapchainImage", &waitFn))) {
@@ -1107,6 +1118,26 @@ namespace openxr_api_layer {
                 if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrReleaseSwapchainImage", &releaseFn))) {
                     m_xrReleaseSwapchainImage = reinterpret_cast<PFN_xrReleaseSwapchainImage>(releaseFn);
                 }
+
+                PFN_xrVoidFunction destroySessionFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrDestroySession", &destroySessionFn))) {
+                    m_xrDestroySession = reinterpret_cast<PFN_xrDestroySession>(destroySessionFn);
+                }
+
+                PFN_xrVoidFunction createRefSpaceFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrCreateReferenceSpace", &createRefSpaceFn))) {
+                    m_xrCreateReferenceSpace = reinterpret_cast<PFN_xrCreateReferenceSpace>(createRefSpaceFn);
+                }
+
+                PFN_xrVoidFunction destroySpaceFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrDestroySpace", &destroySpaceFn))) {
+                    m_xrDestroySpace = reinterpret_cast<PFN_xrDestroySpace>(destroySpaceFn);
+                }
+
+                // Signal deferred construction of HoldingPen + RuntimeThread.
+                // Actual construction is deferred to first xrEndFrame once the
+                // injection swapchain and its images are available.
+                m_needHoldingPenInit = true;
             }
             return result;
         }
@@ -1296,214 +1327,132 @@ namespace openxr_api_layer {
                     }
                 }
 
-                VkImage currentColor = m_frameBroker.GetCurrentColorImage();
-                VkImage currentDepth = VK_NULL_HANDLE;
+                // Phase 3: copy current color frame into the holding pen and return
+                // immediately. The RuntimeThread owns compositor submission.
+                EnsureHoldingPenAndRuntimeThread();
 
-                // 2. Grab Current Depth (prefer depth chained on projection views)
-                if (m_frameContext.depthViews[0].valid) {
-                    currentDepth = m_frameContext.depthViews[0].image;
-                } else if (m_frameContext.depthViews[1].valid) {
-                    currentDepth = m_frameContext.depthViews[1].image;
-                } else {
-                    currentDepth = m_frameBroker.GetCurrentDepthImage();
-                }
-
-                // 3. Process if we have a previous frame!
-                if (m_processor && currentColor && currentDepth && m_prevColor && m_prevDepth) {
-                    m_processor->PollCompletedWork();
-
-                    // TODO (Item 4): Pre-OFA pose pre-warp
-                    // When Item 2 (Pose Data Pipeline) is complete:
-                    //   1. Extract XrPosef render_pose and display_pose from frameEndInfo projection layers
-                    //   2. Compute pose_delta = display_pose * inverse(render_pose)
-                    //   3. Extract rotation quaternion from pose_delta
-                    //   4. Compute homography from rotation and m_fovLeft (using pose_warp_math::computeIntrinsics)
-                    //   5. Create temporary CUarrays from m_prevColor via Vulkan/CUDA interop
-                    //   6. Call m_poseWarper->warp() to apply homography to m_prevColor
-                    //   7. Feed warped frame to OFA (when OFA integration is complete)
-                    // This removes camera rotation from the motion field, improving OFA quality.
-
-                    // Dispatch to GPU. Do NOT wait for idle.
-                    const bool submitted = m_processor->ProcessFrames(
-                        currentColor,
-                        currentDepth,
-                        m_prevColor,
-                        m_prevDepth,
-                        m_frameBroker.GetSwapchainWidth(),
-                        m_frameBroker.GetSwapchainHeight());
-                    (void)submitted;
-                    if (m_processor->HasFullyValidOutput()) {
-                        m_synthesizedColor = m_processor->GetLatestOutputImage();
-                        m_hasSynthesisOutput = true;
-
-                        const auto& stageValidity = m_processor->GetLatestStageValidity();
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Synthesis_Stage_Validity",
-                                          TLArg(stageValidity.preWarp, "PreWarp"),
-                                          TLArg(stageValidity.ofa, "OFA"),
-                                          TLArg(stageValidity.depthLinearization, "DepthLinearization"),
-                                          TLArg(stageValidity.stereoAdaptation, "StereoAdaptation"),
-                                          TLArg(stageValidity.synthesis, "Synthesis"),
-                                          TLArg(stageValidity.holeFill, "HoleFill"),
-                                          TLArg(stageValidity.FullyValid(), "FullyValid"));
-                    } else {
-                        const auto& stageValidity = m_processor->GetLatestStageValidity();
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Synthesis_Stage_Validity",
-                                          TLArg(stageValidity.preWarp, "PreWarp"),
-                                          TLArg(stageValidity.ofa, "OFA"),
-                                          TLArg(stageValidity.depthLinearization, "DepthLinearization"),
-                                          TLArg(stageValidity.stereoAdaptation, "StereoAdaptation"),
-                                          TLArg(stageValidity.synthesis, "Synthesis"),
-                                          TLArg(stageValidity.holeFill, "HoleFill"),
-                                          TLArg(stageValidity.FullyValid(), "FullyValid"),
-                                          TLArg(m_processor->IsLivePipelineReady(), "LivePipelineReady"),
-                                          TLArg(m_processor->GetLastPipelineFailureReason(), "FailureReason"));
-                    }
-
-                    if (m_processor->GetFenceBusyCount() >= VulkanFrameProcessor::kCommandBufferRingSize) {
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Synthesis_Fence_Starvation",
-                                          TLArg(m_processor->GetFenceBusyCount(), "BusyStreak"));
-                    }
-                }
-
-                // TODO: When OFA pipeline is integrated, invoke stereo vector adaptation here.
-                // Note: current StereoVectorAdapter::adapt() performs cudaDeviceSynchronize();
-                // hot-path integration should use a stream-based API to avoid CPU blocking.
-
-                // 4. Update our history buffers for the NEXT frame (t-1)
-                m_prevColor = currentColor;
-                m_prevDepth = currentDepth;
-
-                TraceLoggingWrite(g_traceProvider,
-                                  "Frame_Broker_State",
-                                  TLArg(currentColor != VK_NULL_HANDLE, "HasColor"),
-                                  TLArg(currentDepth != VK_NULL_HANDLE, "HasDepth"),
-                                  TLArg(m_hasSynthesisOutput, "HasSynthesisOutput"));
-            }
-
-            const XrFrameEndInfo* submitFrameEndInfo = frameEndInfo;
-            XrFrameEndInfo frameEndInfoCopy{};
-            std::vector<const XrCompositionLayerBaseHeader*> layerPointers;
-            std::vector<XrCompositionLayerProjection> projectionLayerCopies;
-            std::vector<std::vector<XrCompositionLayerProjectionView>> projectionViewCopies;
-
-            if (m_enableFrameRewrite && session == m_session && m_apiType == GraphicsAPI::Vulkan && frameEndInfo != nullptr &&
-                frameEndInfo->type == XR_TYPE_FRAME_END_INFO && frameEndInfo->layerCount > 0 && m_frameInjection.IsReady()) {
-                uint32_t injectionIndex = 0;
-                bool shouldRewrite = false;
-                bool acquiredInjectionImage = false;
-
-                bool synthesisReady = m_hasSynthesisOutput && m_synthesizedColor != VK_NULL_HANDLE && m_processor != nullptr;
-                if (!synthesisReady) {
-                    TraceLoggingWrite(g_traceProvider,
-                                      "Frame_Rewrite_Skipped",
-                                      TLArg("NoCompletedOutputYet", "Reason"),
-                                      TLArg(m_processor ? m_processor->GetLastPipelineFailureReason() : "", "PipelineFailureReason"));
-                }
-
-                if (synthesisReady && m_xrWaitSwapchainImage != nullptr && m_xrReleaseSwapchainImage != nullptr) {
-                    const XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-                    const XrResult acquireResult = OpenXrApi::xrAcquireSwapchainImage(m_frameInjection.Swapchain(), &acquireInfo, &injectionIndex);
-                    if (XR_SUCCEEDED(acquireResult)) {
-                        acquiredInjectionImage = true;
-                        const XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, nullptr, XR_INFINITE_DURATION};
-                        const XrResult waitResult = m_xrWaitSwapchainImage(m_frameInjection.Swapchain(), &waitInfo);
-                        if (XR_SUCCEEDED(waitResult)) {
-                            if (injectionIndex < m_injectionVulkanImages.size()) {
-                                const VkImage sourceColor = m_synthesizedColor;
-                                const VkImage injectionColor = m_injectionVulkanImages[injectionIndex];
-                                shouldRewrite = sourceColor != VK_NULL_HANDLE && injectionColor != VK_NULL_HANDLE &&
-                                                m_processor->CopyColorImage(sourceColor,
-                                                                           injectionColor,
-                                                                           m_frameBroker.GetSwapchainWidth(),
-                                                                           m_frameBroker.GetSwapchainHeight());
-                                if (!shouldRewrite) {
-                                    TraceLoggingWrite(g_traceProvider,
-                                                      "Frame_Rewrite_Skipped",
-                                                      TLArg("CopyFailed", "Reason"));
-                                }
-                            } else {
-                                TraceLoggingWrite(g_traceProvider,
-                                                  "Frame_Rewrite_Skipped",
-                                                  TLArg("InjectionIndexOutOfRange", "Reason"));
-                            }
-                        } else {
-                            TraceLoggingWrite(g_traceProvider,
-                                              "Frame_Rewrite_Skipped",
-                                              TLArg("WaitFailed", "Reason"),
-                                              TLArg(xr::ToCString(waitResult), "Result"));
+                if (m_holdingPen) {
+                    VkImage currentColor = m_frameBroker.GetCurrentColorImage();
+                    if (currentColor != VK_NULL_HANDLE) {
+                        // Render pose: use left-eye pose from the projection layer.
+                        XrPosef renderPose{};
+                        renderPose.orientation = {0.f, 0.f, 0.f, 1.f};
+                        if (m_frameContext.renderViews[0].valid) {
+                            renderPose = m_frameContext.renderViews[0].pose;
                         }
-                    } else {
+
+                        m_holdingPen->SubmitCopy(
+                            currentColor,
+                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            frameEndInfo ? frameEndInfo->displayTime : 0,
+                            renderPose);
+
                         TraceLoggingWrite(g_traceProvider,
-                                          "Frame_Rewrite_Skipped",
-                                          TLArg("AcquireFailed", "Reason"),
-                                          TLArg(xr::ToCString(acquireResult), "Result"));
+                                          "HoldingPen_CopySubmitted",
+                                          TLArg(true, "HasColor"),
+                                          TLArg(frameEndInfo ? frameEndInfo->displayTime : 0LL, "DisplayTime"));
                     }
-                }
-
-                if (acquiredInjectionImage) {
-                    const XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                    const XrResult releaseResult = m_xrReleaseSwapchainImage(m_frameInjection.Swapchain(), &releaseInfo);
-                    if (XR_FAILED(releaseResult)) {
-                        shouldRewrite = false;
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Injection_Release_Failed",
-                                          TLArg(xr::ToCString(releaseResult), "Result"));
-                    }
-                }
-
-                if (shouldRewrite) {
-                    projectionLayerCopies.reserve(frameEndInfo->layerCount);
-                    projectionViewCopies.reserve(frameEndInfo->layerCount);
-                    layerPointers.reserve(frameEndInfo->layerCount);
-
-                    for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
-                        const XrCompositionLayerBaseHeader* baseLayer = frameEndInfo->layers[i];
-                        if (baseLayer != nullptr && baseLayer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-                            const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(baseLayer);
-                            projectionLayerCopies.push_back(*projection);
-                            projectionViewCopies.emplace_back();
-                            auto& viewsCopy = projectionViewCopies.back();
-                            viewsCopy.resize(projection->viewCount);
-                            if (projection->viewCount > 0 && projection->views != nullptr) {
-                                std::copy_n(projection->views, projection->viewCount, viewsCopy.begin());
-                            }
-
-                            auto& projectionCopy = projectionLayerCopies.back();
-                            for (uint32_t viewIndex = 0; viewIndex < projection->viewCount; ++viewIndex) {
-                                auto& view = viewsCopy[viewIndex];
-                                view.subImage.swapchain = m_frameInjection.Swapchain();
-                                view.subImage.imageArrayIndex = projection->views[viewIndex].subImage.imageArrayIndex;
-                                view.subImage.imageRect = projection->views[viewIndex].subImage.imageRect;
-                            }
-                            projectionCopy.views = viewsCopy.data();
-                            layerPointers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionCopy));
-                        } else {
-                            layerPointers.push_back(baseLayer);
-                        }
-                    }
-
-                    frameEndInfoCopy = *frameEndInfo;
-                    frameEndInfoCopy.layers = layerPointers.data();
-                    submitFrameEndInfo = &frameEndInfoCopy;
-                }
-
-                if (m_hasSynthesisOutput && m_synthesizedColor != VK_NULL_HANDLE) {
-                    TraceLoggingWrite(g_traceProvider,
-                                      "Frame_Injection_Ready",
-                                      TLArg(m_frameInjection.IsReady(), "InjectionSwapchainReady"),
-                                      TLArg(true, "SynthesisReady"));
+                    // Return immediately — RuntimeThread handles compositor submission.
+                    return XR_SUCCESS;
                 }
             }
 
-            // Finally, pass it back to the OpenXR runtime so it gets to the headset
-            return OpenXrApi::xrEndFrame(session, submitFrameEndInfo);
+            // Fallback: HoldingPen not yet ready — pass through original submission.
+            return OpenXrApi::xrEndFrame(session, frameEndInfo);
         }
 
 
+        // Phase 3 teardown — called from xrCreateSession (re-create path) and destructor.
+        void TeardownPhase3Resources() {
+            Log("TeardownPhase3Resources: shutting down RuntimeThread and HoldingPen.\n");
+            if (m_runtimeThread) {
+                m_runtimeThread->RequestShutdownAndJoin();
+                m_runtimeThread.reset();
+            }
+            if (m_holdingPen) {
+                m_holdingPen->DrainAndDestroy();
+                m_holdingPen.reset();
+            }
+            if (m_localSpace != XR_NULL_HANDLE && m_xrDestroySpace) {
+                m_xrDestroySpace(m_localSpace);
+                m_localSpace = XR_NULL_HANDLE;
+            }
+            m_processor.reset();
+            m_session = XR_NULL_HANDLE;
+            m_needHoldingPenInit = false;
+        }
+
       private:
+        // Deferred construction: called from xrEndFrame once the injection swapchain
+        // and its images are enumerated. Safe to call every frame — exits immediately
+        // once initialized.
+        void EnsureHoldingPenAndRuntimeThread() {
+            if (!m_needHoldingPenInit || m_holdingPen) return;
+            if (!m_frameInjection.IsReady()) return;
+            if (m_injectionVulkanImages.empty()) return;
+            if (m_vkDevice == VK_NULL_HANDLE) return;
+
+            const uint32_t w = m_frameBroker.GetSwapchainWidth();
+            const uint32_t h = m_frameBroker.GetSwapchainHeight();
+            if (w == 0 || h == 0) return;
+
+            const auto infoOpt = m_frameBroker.GetPrimaryColorCreateInfo();
+            if (!infoOpt) return;
+            const VkFormat fmt = static_cast<VkFormat>(infoOpt->format);
+
+            VkQueue queue = VK_NULL_HANDLE;
+            vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &queue);
+            if (queue == VK_NULL_HANDLE) return;
+
+            // Create the local XrSpace used by RuntimeThread for projection layers.
+            XrReferenceSpaceCreateInfo spaceCI{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+            spaceCI.referenceSpaceType     = XR_REFERENCE_SPACE_TYPE_LOCAL;
+            spaceCI.poseInReferenceSpace   = {{0.f, 0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}};
+            if (!m_xrCreateReferenceSpace ||
+                XR_FAILED(m_xrCreateReferenceSpace(m_session, &spaceCI, &m_localSpace))) {
+                Log("[ERROR] EnsureHoldingPenAndRuntimeThread: xrCreateReferenceSpace failed.\n");
+                return;
+            }
+
+            try {
+                m_holdingPen = std::make_unique<HoldingPen>(
+                    m_vkPhysicalDevice, m_vkDevice,
+                    queue, m_vkQueueFamilyIndex, m_vkQueueFamilyIndex,
+                    w, h, fmt);
+
+                m_runtimeThread = std::make_unique<RuntimeThread>(
+                    *this, m_session,
+                    *m_holdingPen,
+                    m_frameInjection.Swapchain(),
+                    m_injectionVulkanImages,
+                    m_localSpace,
+                    m_vkDevice,
+                    queue,
+                    m_vkQueueFamilyIndex,
+                    w, h,
+                    m_xrBeginFrame,
+                    m_xrWaitSwapchainImage,
+                    m_xrReleaseSwapchainImage);
+
+                m_needHoldingPenInit = false;
+                Log(fmt::format(
+                    "HoldingPen + RuntimeThread initialized: {}x{} fmt={}\n", w, h, (int)fmt));
+                TraceLoggingWrite(g_traceProvider,
+                                  "Phase3_Initialized",
+                                  TLArg(w, "Width"),
+                                  TLArg(h, "Height"),
+                                  TLArg((int)fmt, "Format"));
+            } catch (const std::exception& e) {
+                Log(fmt::format("[ERROR] EnsureHoldingPenAndRuntimeThread: {}\n", e.what()));
+                m_holdingPen.reset();
+                m_runtimeThread.reset();
+                if (m_localSpace != XR_NULL_HANDLE && m_xrDestroySpace) {
+                    m_xrDestroySpace(m_localSpace);
+                    m_localSpace = XR_NULL_HANDLE;
+                }
+            }
+        }
+
         void EnsureInjectionSwapchainImagesEnumerated() {
             if (!m_frameInjection.IsReady()) {
                 return;
@@ -1558,6 +1507,10 @@ namespace openxr_api_layer {
         XrSession m_session{XR_NULL_HANDLE};
 
         std::unique_ptr<VulkanFrameProcessor> m_processor;
+        std::unique_ptr<HoldingPen>           m_holdingPen;
+        std::unique_ptr<RuntimeThread>        m_runtimeThread;
+        bool     m_needHoldingPenInit{false};
+        XrSpace  m_localSpace{XR_NULL_HANDLE};
         PFN_xrGetVulkanInstanceExtensionsKHR m_xrGetVulkanInstanceExtensionsKHR{nullptr};
         PFN_xrGetVulkanDeviceExtensionsKHR m_xrGetVulkanDeviceExtensionsKHR{nullptr};
         FrameBroker m_frameBroker;
@@ -1566,8 +1519,12 @@ namespace openxr_api_layer {
         PoseProvider m_poseProvider;
         DepthProvider m_depthProvider;
         FrameContext m_frameContext{};
-        PFN_xrWaitSwapchainImage m_xrWaitSwapchainImage{nullptr};
-        PFN_xrReleaseSwapchainImage m_xrReleaseSwapchainImage{nullptr};
+        PFN_xrBeginFrame              m_xrBeginFrame{nullptr};
+        PFN_xrWaitSwapchainImage      m_xrWaitSwapchainImage{nullptr};
+        PFN_xrReleaseSwapchainImage   m_xrReleaseSwapchainImage{nullptr};
+        PFN_xrDestroySession          m_xrDestroySession{nullptr};
+        PFN_xrCreateReferenceSpace    m_xrCreateReferenceSpace{nullptr};
+        PFN_xrDestroySpace            m_xrDestroySpace{nullptr};
         bool m_depthWarningLogged{false};
         VkImage m_synthesizedColor{VK_NULL_HANDLE};
         bool m_hasSynthesisOutput{false};
