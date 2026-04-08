@@ -112,6 +112,11 @@ void RuntimeThread::ThreadBody() {
         if (XR_FAILED(result)) {
             break;
         }
+
+        // Publish timing for app-thread synthetic xrWaitFrame.
+        if (frameState.predictedDisplayPeriod > 0)
+            m_displayPeriod.store(frameState.predictedDisplayPeriod, std::memory_order_release);
+        m_lastDisplayTime.store(frameState.predictedDisplayTime, std::memory_order_release);
         if (m_shutdownRequested.load(std::memory_order_acquire)) {
             // Still must call xrBeginFrame + xrEndFrame to keep the session valid.
             XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};

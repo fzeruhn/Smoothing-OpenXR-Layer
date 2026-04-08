@@ -78,6 +78,14 @@ class RuntimeThread {
     // Update the local XrSpace after it is created in xrCreateSession.
     void SetLocalSpace(XrSpace space) { m_localSpace = space; }
 
+    // Read by the app-thread synthetic xrWaitFrame path. Thread-safe (atomic).
+    int64_t GetLastDisplayTime() const {
+        return m_lastDisplayTime.load(std::memory_order_acquire);
+    }
+    int64_t GetDisplayPeriod() const {
+        return m_displayPeriod.load(std::memory_order_acquire);
+    }
+
   private:
     void ThreadBody();
 
@@ -122,8 +130,13 @@ class RuntimeThread {
     PFN_xrReleaseSwapchainImage m_xrReleaseSwapchainImage{nullptr};
 
     // ---- thread state ----
-    std::atomic<bool> m_shutdownRequested{false};
-    std::thread       m_thread;
+    std::atomic<bool>    m_shutdownRequested{false};
+    std::thread          m_thread;
+
+    // Written by RuntimeThread after each real xrWaitFrame; read by the app-thread
+    // synthetic xrWaitFrame path in layer.cpp.
+    std::atomic<int64_t> m_lastDisplayTime{0};
+    std::atomic<int64_t> m_displayPeriod{11111111LL}; // ~90 Hz default
 
     // ---- per-iteration state (runtime thread only) ----
     std::optional<HoldingPen::ReadySlot> m_lastSubmittedSlot;
