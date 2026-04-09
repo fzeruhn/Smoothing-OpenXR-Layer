@@ -1248,24 +1248,27 @@ namespace openxr_api_layer {
                 return OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
             }
 
-            // App thread: if RuntimeThread owns pacing, synthesize XrFrameState immediately.
-            // This prevents two simultaneous real xrWaitFrame callers on the same session.
+            // App thread: if RuntimeThread owns pacing, block until it has called
+            // xrBeginFrame, then return a synthetic XrFrameState.
+            //
+            // WaitForBeginFrame() is called unconditionally (even on the first frame
+            // before lastTime is published). The RuntimeThread stores lastTime BEFORE
+            // signalling the condvar, so lastTime is guaranteed non-zero when we wake.
+            // This makes the RuntimeThread the sole caller of the real xrWaitFrame
+            // from frame 1 onward, closing the first-frame race window.
             if (m_runtimeThread && session == m_session && frameState) {
+                m_runtimeThread->WaitForBeginFrame();
+
                 const int64_t lastTime = m_runtimeThread->GetLastDisplayTime();
                 const int64_t period   = m_runtimeThread->GetDisplayPeriod();
-                if (lastTime != 0) {
-                    // Block until RuntimeThread has called xrBeginFrame so that
-                    // the app's subsequent xrAcquireSwapchainImage is safe.
-                    m_runtimeThread->WaitForBeginFrame();
 
-                    frameState->type                   = XR_TYPE_FRAME_STATE;
-                    frameState->next                   = nullptr;
-                    frameState->predictedDisplayTime   = lastTime + period;
-                    frameState->predictedDisplayPeriod = period;
-                    frameState->shouldRender           = XR_TRUE;
-                    m_poseProvider.OnWaitFrame(*frameState);
-                    return XR_SUCCESS;
-                }
+                frameState->type                   = XR_TYPE_FRAME_STATE;
+                frameState->next                   = nullptr;
+                frameState->predictedDisplayTime   = lastTime + period;
+                frameState->predictedDisplayPeriod = period;
+                frameState->shouldRender           = XR_TRUE;
+                m_poseProvider.OnWaitFrame(*frameState);
+                return XR_SUCCESS;
             }
 
             // RuntimeThread not yet active (or no timing available yet) — real call.
