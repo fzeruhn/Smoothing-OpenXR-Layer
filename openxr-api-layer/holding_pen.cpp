@@ -301,21 +301,6 @@ std::optional<HoldingPen::ReadySlot> HoldingPen::ConsumeLatest() {
 }
 
 // ---------------------------------------------------------------------------
-// MarkConsumed (runtime thread)
-// ---------------------------------------------------------------------------
-
-void HoldingPen::MarkConsumed(int slotIndex) {
-    // Submit an empty batch to signal the consumed fence, freeing this slot
-    // for the app thread to reuse.
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    {
-        std::lock_guard<std::mutex> lock(g_queueMutex);
-        vkQueueSubmit(m_appQueue, 1, &submitInfo, m_slots[slotIndex].consumed);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // DrainAndDestroy
 // ---------------------------------------------------------------------------
 

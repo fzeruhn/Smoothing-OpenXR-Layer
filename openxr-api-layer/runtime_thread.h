@@ -106,10 +106,13 @@ class RuntimeThread {
     // Path A: blit the holding pen slot image into the injection swapchain and
     // submit it to xrEndFrame. waitSemaphore is the slot's copyDone binary
     // semaphore; pass VK_NULL_HANDLE when resubmitting a cached slot (Path B).
+    // consumedFence is attached to the blit vkQueueSubmit so it fires when the
+    // GPU finishes reading the slot, safely freeing it for the app thread.
     void SubmitSlotImage(XrTime displayTime,
                          VkImage sourceImage,
                          VkSemaphore waitSemaphore,
-                         XrPosef pose);
+                         XrPosef pose,
+                         VkFence consumedFence = VK_NULL_HANDLE);
 
     // Path B: submit the last cached frame (Phase 3 stub — no CUDA warp yet).
     void SubmitCachedFrame(XrTime displayTime);
