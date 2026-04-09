@@ -1371,12 +1371,31 @@ namespace openxr_api_layer {
 
                 if (m_holdingPen && !m_holdingPenActive) {
                     // Frame 1: HoldingPen was just constructed this xrEndFrame.
-                    // Pass through to the real compositor so SteamVR's Frame 1
-                    // xrBeginFrame is properly closed. RuntimeThread will take over
-                    // from Frame 2 onward (after m_holdingPenActive is set).
-                    Log("Phase3: Frame 1 pass-through — closing orphaned xrBeginFrame.\n");
+                    // 1) Pass through to the real compositor so SteamVR's Frame 1
+                    //    xrBeginFrame is properly closed.
+                    // 2) Seed the HoldingPen with Frame 1's image so RuntimeThread
+                    //    has a valid slot on its very first ConsumeLatest() call,
+                    //    preventing SubmitBlackFrame (layerCount=0) on startup.
+                    Log("Phase3: Frame 1 pass-through + HoldingPen seed.\n");
                     m_holdingPenActive = true;
-                    // Fall through to OpenXrApi::xrEndFrame below.
+
+                    const XrResult passResult = OpenXrApi::xrEndFrame(session, frameEndInfo);
+
+                    VkImage seedColor = m_frameBroker.GetCurrentColorImage();
+                    if (seedColor != VK_NULL_HANDLE) {
+                        XrPosef seedPose{};
+                        seedPose.orientation = {0.f, 0.f, 0.f, 1.f};
+                        if (m_frameContext.renderViews[0].valid) {
+                            seedPose = m_frameContext.renderViews[0].pose;
+                        }
+                        m_holdingPen->SubmitCopy(
+                            seedColor,
+                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            frameEndInfo ? frameEndInfo->displayTime : 0,
+                            seedPose);
+                        Log("Phase3: Frame 1 seed copy submitted.\n");
+                    }
+                    return passResult;
                 } else if (m_holdingPen && m_holdingPenActive) {
                     VkImage currentColor = m_frameBroker.GetCurrentColorImage();
                     if (currentColor != VK_NULL_HANDLE) {
