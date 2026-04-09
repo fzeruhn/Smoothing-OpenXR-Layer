@@ -1237,6 +1237,36 @@ namespace openxr_api_layer {
             return result;
         }
 
+        // 2.6. HOOK SWAPCHAIN RELEASE — copy app image before SteamVR takes ownership
+        // The app's color swapchain image is in COLOR_ATTACHMENT_OPTIMAL here, and
+        // we own it. After the real xrReleaseSwapchainImage returns, SteamVR may
+        // queue a GPU layout transition on its compositor queue. Submitting our copy
+        // AFTER that point means our barrier declares the wrong oldLayout → device
+        // lost. Doing it HERE, before the release, guarantees correct ownership and
+        // layout. The GPU copy completes before SteamVR's compositor reads the image
+        // (~11ms window vs microseconds for a memcpy-sized GPU blit).
+        XrResult xrReleaseSwapchainImage(XrSwapchain swapchain,
+                                          const XrSwapchainImageReleaseInfo* releaseInfo) override {
+            if (!g_isRuntimeThread && m_holdingPen && m_holdingPenActive &&
+                m_frameBroker.IsColorSwapchain(swapchain) &&
+                swapchain == m_frameBroker.GetPrimaryColorSwapchain()) {
+                VkImage colorImage = m_frameBroker.GetCurrentImageForSwapchain(swapchain);
+                if (colorImage != VK_NULL_HANDLE) {
+                    XrPosef pose{};
+                    pose.orientation = {0.f, 0.f, 0.f, 1.f};
+                    if (m_frameContext.renderViews[0].valid) {
+                        pose = m_frameContext.renderViews[0].pose;
+                    }
+                    const XrTime displayTime =
+                        m_runtimeThread ? m_runtimeThread->GetLastDisplayTime() : 0;
+                    m_holdingPen->SubmitCopy(colorImage,
+                                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                             displayTime, pose);
+                }
+            }
+            return OpenXrApi::xrReleaseSwapchainImage(swapchain, releaseInfo);
+        }
+
         // 2.5. HOOK SESSION DESTROY
         // Must stop the RuntimeThread before the session handle becomes invalid.
         // If we don't join here, the RuntimeThread is inside xrWaitFrame when
@@ -1431,27 +1461,13 @@ namespace openxr_api_layer {
                     }
                     return passResult;
                 } else if (m_holdingPen && m_holdingPenActive) {
-                    VkImage currentColor = m_frameBroker.GetCurrentColorImage();
-                    if (currentColor != VK_NULL_HANDLE) {
-                        // Render pose: use left-eye pose from the projection layer.
-                        XrPosef renderPose{};
-                        renderPose.orientation = {0.f, 0.f, 0.f, 1.f};
-                        if (m_frameContext.renderViews[0].valid) {
-                            renderPose = m_frameContext.renderViews[0].pose;
-                        }
-
-                        m_holdingPen->SubmitCopy(
-                            currentColor,
-                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            frameEndInfo ? frameEndInfo->displayTime : 0,
-                            renderPose);
-
-                        TraceLoggingWrite(g_traceProvider,
-                                          "HoldingPen_CopySubmitted",
-                                          TLArg(true, "HasColor"),
-                                          TLArg(frameEndInfo ? frameEndInfo->displayTime : 0LL, "DisplayTime"));
-                    }
-                    // Return immediately — RuntimeThread handles compositor submission.
+                    // Copy already submitted in xrReleaseSwapchainImage (before the image
+                    // was handed to SteamVR). Nothing to do here except signal the trace
+                    // event and return XR_SUCCESS; RuntimeThread handles compositor submission.
+                    TraceLoggingWrite(g_traceProvider,
+                                      "HoldingPen_CopySubmitted",
+                                      TLArg(true, "HasColor"),
+                                      TLArg(frameEndInfo ? frameEndInfo->displayTime : 0LL, "DisplayTime"));
                     return XR_SUCCESS;
                 }
             }
