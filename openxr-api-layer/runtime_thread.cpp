@@ -121,6 +121,13 @@ void RuntimeThread::ThreadBody() {
             // Still must call xrBeginFrame + xrEndFrame to keep the session valid.
             XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
             if (m_xrBeginFrame) m_xrBeginFrame(m_session, &beginInfo);
+            // Signal before SubmitBlackFrame so the app thread doesn't deadlock
+            // in WaitForBeginFrame() while we're doing the final submission.
+            {
+                std::lock_guard<std::mutex> lk(m_beginMutex);
+                m_beginFrameReady = true;
+            }
+            m_beginCv.notify_one();
             SubmitBlackFrame(frameState.predictedDisplayTime);
             break;
         }
