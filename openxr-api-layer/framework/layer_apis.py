@@ -8,6 +8,7 @@ override_functions = [
     "xrWaitFrame",
     "xrEndFrame",
     "xrAcquireSwapchainImage",
+    "xrPollEvent",
 ]
 
 # The list of OpenXR functions our layer will use from the runtime.
