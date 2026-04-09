@@ -364,17 +364,23 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
     subImage.imageRect.extent      = {static_cast<int32_t>(m_imageWidth),
                                       static_cast<int32_t>(m_imageHeight)};
 
-    XrCompositionLayerProjectionView projView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-    projView.subImage = subImage;
-    projView.pose     = pose;
-    // Default FOV (~90° horizontal, 90° vertical). Phase 4 will thread real FOV.
-    projView.fov      = {-0.7854f, 0.7854f, 0.7854f, -0.7854f};
-    // pNext = nullptr — no depth chain in Phase 3.
+    // Stereo requires viewCount=2. Both eyes receive the same full-resolution
+    // injection image with the same pose. Phase 4 will supply per-eye poses and
+    // a warped right-eye image; for Phase 3 this satisfies the spec requirement
+    // and SteamVR's strict viewCount validation without crashing.
+    XrCompositionLayerProjectionView projViews[2]{};
+    for (int eye = 0; eye < 2; ++eye) {
+        projViews[eye].type     = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+        projViews[eye].subImage = subImage;
+        projViews[eye].pose     = pose;
+        // Default FOV (~90° horizontal, 90° vertical). Phase 4 will thread real FOV.
+        projViews[eye].fov      = {-0.7854f, 0.7854f, 0.7854f, -0.7854f};
+    }
 
     XrCompositionLayerProjection projLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projLayer.space      = m_localSpace;
-    projLayer.viewCount  = 1;
-    projLayer.views      = &projView;
+    projLayer.viewCount  = 2;
+    projLayer.views      = projViews;
 
     const XrCompositionLayerBaseHeader* layers[] = {
         reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer)
@@ -450,15 +456,18 @@ void RuntimeThread::SubmitBlackFrame(XrTime displayTime) {
             XrPosef identityPose{};
             identityPose.orientation = {0.f, 0.f, 0.f, 1.f};
 
-            XrCompositionLayerProjectionView projView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-            projView.subImage = subImage;
-            projView.pose     = identityPose;
-            projView.fov      = {-0.7854f, 0.7854f, 0.7854f, -0.7854f};
+            XrCompositionLayerProjectionView projViews[2]{};
+            for (int eye = 0; eye < 2; ++eye) {
+                projViews[eye].type     = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                projViews[eye].subImage = subImage;
+                projViews[eye].pose     = identityPose;
+                projViews[eye].fov      = {-0.7854f, 0.7854f, 0.7854f, -0.7854f};
+            }
 
             XrCompositionLayerProjection projLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             projLayer.space     = m_localSpace;
-            projLayer.viewCount = 1;
-            projLayer.views     = &projView;
+            projLayer.viewCount = 2;
+            projLayer.views     = projViews;
 
             const XrCompositionLayerBaseHeader* layers[] = {
                 reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer)
