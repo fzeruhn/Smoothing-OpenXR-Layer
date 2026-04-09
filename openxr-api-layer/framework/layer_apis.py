@@ -2,6 +2,7 @@
 override_functions = [
     "xrGetSystem",
     "xrCreateSession",
+    "xrDestroySession",
     "xrCreateSwapchain",
     "xrEnumerateSwapchainImages",
     "xrWaitFrame",
