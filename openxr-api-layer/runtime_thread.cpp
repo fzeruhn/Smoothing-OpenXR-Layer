@@ -2,10 +2,14 @@
 #include "runtime_thread.h"
 #include "layer.h"
 
+#include <log.h>
+
 #include <stdexcept>
 #include <string>
 #include <cstring>
 #include <mutex>
+
+using namespace openxr_api_layer::log;
 
 namespace openxr_api_layer {
 
@@ -118,7 +122,12 @@ void RuntimeThread::ThreadBody() {
         XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState frameState{XR_TYPE_FRAME_STATE};
         XrResult result = m_api.xrWaitFrame(m_session, &waitInfo, &frameState);
+        if (result != XR_SUCCESS) {
+            Log(fmt::format("RuntimeThread: xrWaitFrame returned {} shouldRender={}\n",
+                result, frameState.shouldRender));
+        }
         if (XR_FAILED(result)) {
+            Log(fmt::format("RuntimeThread: xrWaitFrame failed ({}), exiting loop.\n", result));
             break;
         }
 
@@ -397,7 +406,10 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
     }
 
     // g_isRuntimeThread = true, so xrEndFrame fast-paths to the downstream dispatch.
-    m_api.xrEndFrame(m_session, &endInfo);
+    XrResult endResult = m_api.xrEndFrame(m_session, &endInfo);
+    if (endResult != XR_SUCCESS) {
+        Log(fmt::format("RuntimeThread::SubmitSlotImage: xrEndFrame returned {}\n", endResult));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +490,10 @@ void RuntimeThread::SubmitBlackFrame(XrTime displayTime) {
             endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             endInfo.layerCount           = 1;
             endInfo.layers               = layers;
-            m_api.xrEndFrame(m_session, &endInfo);
+            XrResult endResult = m_api.xrEndFrame(m_session, &endInfo);
+            if (endResult != XR_SUCCESS) {
+                Log(fmt::format("RuntimeThread::SubmitBlackFrame: xrEndFrame returned {}\n", endResult));
+            }
             return;
         }
     }
