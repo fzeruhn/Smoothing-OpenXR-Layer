@@ -1128,11 +1128,6 @@ namespace openxr_api_layer {
                     m_xrReleaseSwapchainImage = reinterpret_cast<PFN_xrReleaseSwapchainImage>(releaseFn);
                 }
 
-                PFN_xrVoidFunction destroySessionFn = nullptr;
-                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrDestroySession", &destroySessionFn))) {
-                    m_xrDestroySession = reinterpret_cast<PFN_xrDestroySession>(destroySessionFn);
-                }
-
                 PFN_xrVoidFunction createRefSpaceFn = nullptr;
                 if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrCreateReferenceSpace", &createRefSpaceFn))) {
                     m_xrCreateReferenceSpace = reinterpret_cast<PFN_xrCreateReferenceSpace>(createRefSpaceFn);
@@ -1240,6 +1235,19 @@ namespace openxr_api_layer {
                 m_frameBroker.OnAcquireSwapchainImage(swapchain, *index); // Remember this index for EndFrame
             }
             return result;
+        }
+
+        // 2.5. HOOK SESSION DESTROY
+        // Must stop the RuntimeThread before the session handle becomes invalid.
+        // If we don't join here, the RuntimeThread is inside xrWaitFrame when
+        // SteamVR frees the internal session object → AV at session->field_0x30.
+        XrResult xrDestroySession(XrSession session) override {
+            if (session == m_session) {
+                Log("xrDestroySession: tearing down Phase3 resources before destroy.\n");
+                TeardownPhase3Resources();
+                m_session = XR_NULL_HANDLE;
+            }
+            return OpenXrApi::xrDestroySession(session);
         }
 
         XrResult xrWaitFrame(XrSession session, const XrFrameWaitInfo* frameWaitInfo, XrFrameState* frameState) override {
@@ -1592,7 +1600,6 @@ namespace openxr_api_layer {
         PFN_xrBeginFrame              m_xrBeginFrame{nullptr};
         PFN_xrWaitSwapchainImage      m_xrWaitSwapchainImage{nullptr};
         PFN_xrReleaseSwapchainImage   m_xrReleaseSwapchainImage{nullptr};
-        PFN_xrDestroySession          m_xrDestroySession{nullptr};
         PFN_xrCreateReferenceSpace    m_xrCreateReferenceSpace{nullptr};
         PFN_xrDestroySpace            m_xrDestroySpace{nullptr};
         bool m_depthWarningLogged{false};
