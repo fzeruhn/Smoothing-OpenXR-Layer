@@ -156,11 +156,14 @@ void RuntimeThread::ThreadBody() {
         if (slot.has_value()) {
             // Path A: fresh frame available.
             m_consecutivePathBCount = 0;
+            // Pass the consumed fence so it fires when the GPU finishes the blit,
+            // not via a separate CPU-side empty submit. This prevents the app thread
+            // from reusing the slot image while the runtime thread's blit is in-flight.
             SubmitSlotImage(frameState.predictedDisplayTime,
                             slot->image,
                             slot->copyDone,
-                            slot->meta.renderPose);
-            m_holdingPen.MarkConsumed(slot->index);
+                            slot->meta.renderPose,
+                            m_holdingPen.GetConsumedFence(slot->index));
             m_lastSubmittedSlot = slot;
         } else {
             // Path B: deadline miss.
@@ -195,7 +198,8 @@ void RuntimeThread::ThreadBody() {
 void RuntimeThread::SubmitSlotImage(XrTime displayTime,
                                     VkImage sourceImage,
                                     VkSemaphore waitSemaphore,
-                                    XrPosef pose) {
+                                    XrPosef pose,
+                                    VkFence consumedFence) {
     if (m_injectionSwapchain == XR_NULL_HANDLE) {
         SubmitBlackFrame(displayTime);
         return;
@@ -299,7 +303,7 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
             }
             {
                 std::lock_guard<std::mutex> lock(g_queueMutex);
-                blitOk = (vkQueueSubmit(m_runtimeQueue, 1, &submitInfo, VK_NULL_HANDLE) == VK_SUCCESS);
+                blitOk = (vkQueueSubmit(m_runtimeQueue, 1, &submitInfo, consumedFence) == VK_SUCCESS);
             }
         }
     }

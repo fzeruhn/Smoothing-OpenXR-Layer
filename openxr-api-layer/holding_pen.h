@@ -68,8 +68,13 @@ class HoldingPen {
     std::optional<ReadySlot> ConsumeLatest();
 
     // Called from the runtime thread after successfully submitting a slot.
-    // Resets the slot's consumed fence so it can be reused by SubmitCopy.
-    void MarkConsumed(int slotIndex);
+    // Returns the consumed fence so RuntimeThread can attach it to its blit
+    // vkQueueSubmit — the fence fires when the GPU finishes reading the slot,
+    // which is the correct moment to free it for the app thread to reuse.
+    VkFence GetConsumedFence(int slotIndex) const {
+        if (slotIndex < 0 || slotIndex >= kSlotCount) return VK_NULL_HANDLE;
+        return m_slots[slotIndex].consumed;
+    }
 
     // Called during teardown. Drains the GPU queue then frees all Vulkan resources.
     void DrainAndDestroy();
