@@ -1256,7 +1256,7 @@ namespace openxr_api_layer {
             // signalling the condvar, so lastTime is guaranteed non-zero when we wake.
             // This makes the RuntimeThread the sole caller of the real xrWaitFrame
             // from frame 1 onward, closing the first-frame race window.
-            if (m_runtimeThread && session == m_session && frameState) {
+            if (m_runtimeThread && m_holdingPenActive && session == m_session && frameState) {
                 m_runtimeThread->WaitForBeginFrame();
 
                 const int64_t lastTime = m_runtimeThread->GetLastDisplayTime();
@@ -1369,7 +1369,15 @@ namespace openxr_api_layer {
                 // immediately. The RuntimeThread owns compositor submission.
                 EnsureHoldingPenAndRuntimeThread();
 
-                if (m_holdingPen) {
+                if (m_holdingPen && !m_holdingPenActive) {
+                    // Frame 1: HoldingPen was just constructed this xrEndFrame.
+                    // Pass through to the real compositor so SteamVR's Frame 1
+                    // xrBeginFrame is properly closed. RuntimeThread will take over
+                    // from Frame 2 onward (after m_holdingPenActive is set).
+                    Log("Phase3: Frame 1 pass-through — closing orphaned xrBeginFrame.\n");
+                    m_holdingPenActive = true;
+                    // Fall through to OpenXrApi::xrEndFrame below.
+                } else if (m_holdingPen && m_holdingPenActive) {
                     VkImage currentColor = m_frameBroker.GetCurrentColorImage();
                     if (currentColor != VK_NULL_HANDLE) {
                         // Render pose: use left-eye pose from the projection layer.
@@ -1403,6 +1411,7 @@ namespace openxr_api_layer {
         // Phase 3 teardown — called from xrCreateSession (re-create path) and destructor.
         void TeardownPhase3Resources() {
             Log("TeardownPhase3Resources: shutting down RuntimeThread and HoldingPen.\n");
+            m_holdingPenActive = false;
             if (m_runtimeThread) {
                 m_runtimeThread->RequestShutdownAndJoin();
                 m_runtimeThread.reset();
@@ -1548,6 +1557,10 @@ namespace openxr_api_layer {
         std::unique_ptr<HoldingPen>           m_holdingPen;
         std::unique_ptr<RuntimeThread>        m_runtimeThread;
         bool     m_needHoldingPenInit{false};
+        // True once the first real xrEndFrame completes after HoldingPen construction.
+        // The RuntimeThread synthetic xrWaitFrame path is gated on this flag so that
+        // Frame 1 always reaches the compositor with a matched xrBeginFrame/xrEndFrame.
+        bool     m_holdingPenActive{false};
         XrSpace  m_localSpace{XR_NULL_HANDLE};
         PFN_xrGetVulkanInstanceExtensionsKHR m_xrGetVulkanInstanceExtensionsKHR{nullptr};
         PFN_xrGetVulkanDeviceExtensionsKHR m_xrGetVulkanDeviceExtensionsKHR{nullptr};
