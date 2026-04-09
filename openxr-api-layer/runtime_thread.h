@@ -7,6 +7,8 @@
 #include <vulkan/vulkan.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -86,6 +88,18 @@ class RuntimeThread {
         return m_displayPeriod.load(std::memory_order_acquire);
     }
 
+    // Called by the app thread's synthetic xrWaitFrame to block until the
+    // RuntimeThread has called xrBeginFrame for the current cycle.
+    // This ensures xrAcquireSwapchainImage is always preceded by a real
+    // xrBeginFrame on the compositor side, keeping SteamVR's state valid.
+    void WaitForBeginFrame() {
+        std::unique_lock<std::mutex> lk(m_beginMutex);
+        m_beginCv.wait(lk, [this] {
+            return m_beginFrameReady || m_shutdownRequested.load(std::memory_order_relaxed);
+        });
+        m_beginFrameReady = false;
+    }
+
   private:
     void ThreadBody();
 
@@ -130,8 +144,11 @@ class RuntimeThread {
     PFN_xrReleaseSwapchainImage m_xrReleaseSwapchainImage{nullptr};
 
     // ---- thread state ----
-    std::atomic<bool>    m_shutdownRequested{false};
-    std::thread          m_thread;
+    std::atomic<bool>         m_shutdownRequested{false};
+    std::thread               m_thread;
+    std::mutex                m_beginMutex;
+    std::condition_variable   m_beginCv;
+    bool                      m_beginFrameReady{false};
 
     // Written by RuntimeThread after each real xrWaitFrame; read by the app-thread
     // synthetic xrWaitFrame path in layer.cpp.
