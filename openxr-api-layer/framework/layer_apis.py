@@ -8,6 +8,7 @@ override_functions = [
     "xrWaitFrame",
     "xrEndFrame",
     "xrAcquireSwapchainImage",
+    "xrReleaseSwapchainImage",
     "xrPollEvent",
 ]
 

@@ -27,11 +27,12 @@ class FrameBroker {
     uint32_t GetSwapchainWidth() const;
     uint32_t GetSwapchainHeight() const;
 
+    VkImage GetCurrentImageForSwapchain(XrSwapchain swapchain) const;
+
     const std::map<XrSwapchain, std::vector<VkImage>>& GetVulkanImages() const;
     const std::map<XrSwapchain, uint32_t>& GetAcquiredIndices() const;
 
   private:
-    VkImage GetCurrentImageForSwapchain(XrSwapchain swapchain) const;
 
     std::vector<XrSwapchain> m_colorSwapchains;
     std::vector<XrSwapchain> m_depthSwapchains;
