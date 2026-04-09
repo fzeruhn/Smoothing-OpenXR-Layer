@@ -129,6 +129,16 @@ void RuntimeThread::ThreadBody() {
         XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
         if (m_xrBeginFrame) m_xrBeginFrame(m_session, &beginInfo);
 
+        // Signal the app thread's synthetic xrWaitFrame that xrBeginFrame has
+        // been called. This unblocks the app so it can safely call
+        // xrAcquireSwapchainImage (which the OpenXR spec requires to follow
+        // xrBeginFrame on the compositor side).
+        {
+            std::lock_guard<std::mutex> lk(m_beginMutex);
+            m_beginFrameReady = true;
+        }
+        m_beginCv.notify_one();
+
         if (!frameState.shouldRender) {
             SubmitBlackFrame(frameState.predictedDisplayTime);
             continue;
@@ -160,6 +170,13 @@ void RuntimeThread::ThreadBody() {
             }
         }
     }
+
+    // Wake any app thread waiting in WaitForBeginFrame so it doesn't deadlock.
+    {
+        std::lock_guard<std::mutex> lk(m_beginMutex);
+        m_beginFrameReady = true;
+    }
+    m_beginCv.notify_all();
 
     g_isRuntimeThread = false;
 }

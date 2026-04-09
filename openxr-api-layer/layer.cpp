@@ -1254,6 +1254,10 @@ namespace openxr_api_layer {
                 const int64_t lastTime = m_runtimeThread->GetLastDisplayTime();
                 const int64_t period   = m_runtimeThread->GetDisplayPeriod();
                 if (lastTime != 0) {
+                    // Block until RuntimeThread has called xrBeginFrame so that
+                    // the app's subsequent xrAcquireSwapchainImage is safe.
+                    m_runtimeThread->WaitForBeginFrame();
+
                     frameState->type                   = XR_TYPE_FRAME_STATE;
                     frameState->next                   = nullptr;
                     frameState->predictedDisplayTime   = lastTime + period;
