@@ -1262,6 +1262,13 @@ namespace openxr_api_layer {
                     m_holdingPen->SubmitCopy(colorImage,
                                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                              displayTime, pose);
+                    // Log every 90 frames (~1 s at 90 Hz) so we can confirm the
+                    // render loop is alive and count frames before any exit.
+                    ++m_releaseFrameCount;
+                    if (m_releaseFrameCount % 90 == 1) {
+                        Log(fmt::format("Phase3: render loop alive — frame {} copy submitted.\n",
+                                        m_releaseFrameCount));
+                    }
                 }
             }
             return OpenXrApi::xrReleaseSwapchainImage(swapchain, releaseInfo);
@@ -1284,24 +1291,45 @@ namespace openxr_api_layer {
         // exactly which state transition is causing it to exit.
         XrResult xrPollEvent(XrInstance instance, XrEventDataBuffer* eventData) override {
             XrResult result = OpenXrApi::xrPollEvent(instance, eventData);
-            if (result == XR_SUCCESS && eventData &&
-                eventData->type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
-                const auto* ev =
-                    reinterpret_cast<const XrEventDataSessionStateChanged*>(eventData);
-                const char* stateName = "unknown";
-                switch (ev->state) {
-                    case XR_SESSION_STATE_IDLE:          stateName = "IDLE";          break;
-                    case XR_SESSION_STATE_READY:         stateName = "READY";         break;
-                    case XR_SESSION_STATE_SYNCHRONIZED:  stateName = "SYNCHRONIZED";  break;
-                    case XR_SESSION_STATE_VISIBLE:       stateName = "VISIBLE";       break;
-                    case XR_SESSION_STATE_FOCUSED:       stateName = "FOCUSED";       break;
-                    case XR_SESSION_STATE_STOPPING:      stateName = "STOPPING";      break;
-                    case XR_SESSION_STATE_LOSS_PENDING:  stateName = "LOSS_PENDING";  break;
-                    case XR_SESSION_STATE_EXITING:       stateName = "EXITING";       break;
-                    default:                                                           break;
+            if (result == XR_SUCCESS && eventData) {
+                switch (eventData->type) {
+                case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+                    const auto* ev =
+                        reinterpret_cast<const XrEventDataSessionStateChanged*>(eventData);
+                    const char* stateName = "unknown";
+                    switch (ev->state) {
+                        case XR_SESSION_STATE_IDLE:         stateName = "IDLE";         break;
+                        case XR_SESSION_STATE_READY:        stateName = "READY";        break;
+                        case XR_SESSION_STATE_SYNCHRONIZED: stateName = "SYNCHRONIZED"; break;
+                        case XR_SESSION_STATE_VISIBLE:      stateName = "VISIBLE";      break;
+                        case XR_SESSION_STATE_FOCUSED:      stateName = "FOCUSED";      break;
+                        case XR_SESSION_STATE_STOPPING:     stateName = "STOPPING";     break;
+                        case XR_SESSION_STATE_LOSS_PENDING: stateName = "LOSS_PENDING"; break;
+                        case XR_SESSION_STATE_EXITING:      stateName = "EXITING";      break;
+                        default: break;
+                    }
+                    Log(fmt::format("xrPollEvent: SESSION_STATE_CHANGED → {} (session={} time={})\n",
+                        stateName, (void*)ev->session, ev->time));
+                    break;
                 }
-                Log(fmt::format("xrPollEvent: SESSION_STATE_CHANGED → {} (session={} time={})\n",
-                    stateName, (void*)ev->session, ev->time));
+                case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING: {
+                    const auto* ev =
+                        reinterpret_cast<const XrEventDataInstanceLossPending*>(eventData);
+                    Log(fmt::format("xrPollEvent: INSTANCE_LOSS_PENDING (lossTime={})\n",
+                        ev->lossTime));
+                    break;
+                }
+                case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
+                    Log("xrPollEvent: INTERACTION_PROFILE_CHANGED\n");
+                    break;
+                case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
+                    Log("xrPollEvent: REFERENCE_SPACE_CHANGE_PENDING\n");
+                    break;
+                default:
+                    Log(fmt::format("xrPollEvent: unknown event type={}\n",
+                        static_cast<int>(eventData->type)));
+                    break;
+                }
             }
             return result;
         }
@@ -1644,7 +1672,8 @@ namespace openxr_api_layer {
         PFN_xrReleaseSwapchainImage   m_xrReleaseSwapchainImage{nullptr};
         PFN_xrCreateReferenceSpace    m_xrCreateReferenceSpace{nullptr};
         PFN_xrDestroySpace            m_xrDestroySpace{nullptr};
-        bool m_depthWarningLogged{false};
+        bool     m_depthWarningLogged{false};
+        uint32_t m_releaseFrameCount{0};
         VkImage m_synthesizedColor{VK_NULL_HANDLE};
         bool m_hasSynthesisOutput{false};
 
