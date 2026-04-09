@@ -140,6 +140,11 @@ class RuntimeThread {
 
     VkCommandPool   m_blitPool{VK_NULL_HANDLE};
     VkCommandBuffer m_blitCmd{VK_NULL_HANDLE};
+    // CPU-side fence for blit completion. Used by SubmitSlotImage to ensure the
+    // injection image is fully written before xrReleaseSwapchainImage hands it
+    // to SteamVR. When consumedFence is provided (Path A) it doubles as this
+    // fence; m_blitDoneFence is the fallback for Path B (cached resubmit).
+    VkFence         m_blitDoneFence{VK_NULL_HANDLE};
 
     // ---- OpenXR function pointers ----
     PFN_xrBeginFrame            m_xrBeginFrame{nullptr};

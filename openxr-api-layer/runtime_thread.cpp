@@ -68,6 +68,12 @@ RuntimeThread::RuntimeThread(OpenXrApi& api,
     cbAI.commandBufferCount = 1;
     CHECK_VK(vkAllocateCommandBuffers(device, &cbAI, &m_blitCmd));
 
+    // Blit-done fence — starts signaled so the first vkResetFences is valid.
+    VkFenceCreateInfo blitFenceCI{};
+    blitFenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    blitFenceCI.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    CHECK_VK(vkCreateFence(device, &blitFenceCI, nullptr, &m_blitDoneFence));
+
     // Start thread last — all state must be initialized first.
     m_thread = std::thread([this] { ThreadBody(); });
 }
@@ -78,6 +84,9 @@ RuntimeThread::RuntimeThread(OpenXrApi& api,
 
 RuntimeThread::~RuntimeThread() {
     RequestShutdownAndJoin();
+    if (m_blitDoneFence != VK_NULL_HANDLE) {
+        vkDestroyFence(m_device, m_blitDoneFence, nullptr);
+    }
     if (m_blitPool != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(m_device, m_blitPool, 1, &m_blitCmd);
         vkDestroyCommandPool(m_device, m_blitPool, nullptr);
@@ -273,10 +282,13 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
                 1, &region);
 
             // Barrier: injection image TRANSFER_DST → COLOR_ATTACHMENT_OPTIMAL.
+            // dstAccessMask=0 / BOTTOM_OF_PIPE: this is a queue-release barrier.
+            // The compositor acquires the image on its own queue and handles its
+            // own visibility — we only need to complete the layout transition here.
             VkImageMemoryBarrier toPresent{};
             toPresent.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             toPresent.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
-            toPresent.dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+            toPresent.dstAccessMask       = 0;
             toPresent.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toPresent.newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -284,7 +296,7 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
             toPresent.image               = injectionImage;
             toPresent.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdPipelineBarrier(m_blitCmd,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                 0, 0, nullptr, 0, nullptr, 1, &toPresent);
 
             vkEndCommandBuffer(m_blitCmd);
@@ -302,10 +314,33 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
                 submitInfo.pWaitDstStageMask  = &waitStage;
             }
             {
+                // Choose the fence for this blit submit:
+                //   Path A (consumedFence valid): signals when GPU finishes,
+                //     gates both SubmitCopy slot reuse and our pre-release wait.
+                //   Path B (consumedFence null / cached resubmit): use
+                //     m_blitDoneFence so we still get a CPU completion signal.
+                VkFence submitFence = consumedFence;
+                if (submitFence == VK_NULL_HANDLE) {
+                    // m_blitDoneFence is signaled from construction or previous
+                    // wait+implicit-signal — safe to reset before reuse.
+                    vkResetFences(m_device, 1, &m_blitDoneFence);
+                    submitFence = m_blitDoneFence;
+                }
                 std::lock_guard<std::mutex> lock(g_queueMutex);
-                blitOk = (vkQueueSubmit(m_runtimeQueue, 1, &submitInfo, consumedFence) == VK_SUCCESS);
+                blitOk = (vkQueueSubmit(m_runtimeQueue, 1, &submitInfo, submitFence) == VK_SUCCESS);
             }
         }
+    }
+
+    // Wait for the GPU to finish the blit before handing the injection image
+    // to SteamVR via xrReleaseSwapchainImage. Without this wait, the compositor
+    // reads a partially-written image, causing "compositor failed EndFrame()".
+    if (blitOk) {
+        VkFence waitFence = (consumedFence != VK_NULL_HANDLE) ? consumedFence : m_blitDoneFence;
+        vkWaitForFences(m_device, 1, &waitFence, VK_TRUE, UINT64_MAX);
+        // m_blitDoneFence is now signaled; leave it for the implicit reset on
+        // next vkResetFences call. consumedFence remains signaled for SubmitCopy
+        // to poll — it will be reset by the app thread when it reuses the slot.
     }
 
     if (m_xrReleaseSwapchainImage) {
