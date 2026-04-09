@@ -374,10 +374,68 @@ void RuntimeThread::SubmitCachedFrame(XrTime displayTime) {
 }
 
 // ---------------------------------------------------------------------------
-// SubmitBlackFrame — empty layer list (compositor shows black)
+// SubmitBlackFrame — minimal valid submission (avoids layerCount=0)
 // ---------------------------------------------------------------------------
 
 void RuntimeThread::SubmitBlackFrame(XrTime displayTime) {
+    // Submitting layerCount=0 activates SteamVR's depth-reprojection codepath,
+    // which has a Vulkan validation bug that causes it to throw std::system_error.
+    // Use the injection swapchain with an identity pose instead — image content
+    // may be uninitialized/stale, but the compositor won't crash on a non-empty
+    // submission. Falls back to the empty submission only if the injection
+    // swapchain is not available yet (shouldn't happen in practice).
+    if (m_injectionSwapchain != XR_NULL_HANDLE && m_localSpace != XR_NULL_HANDLE) {
+        XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        uint32_t imageIndex = 0;
+        XrResult acquireResult = m_api.xrAcquireSwapchainImage(
+            m_injectionSwapchain, &acquireInfo, &imageIndex);
+        if (XR_SUCCEEDED(acquireResult)) {
+            if (m_xrWaitSwapchainImage) {
+                XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                waitInfo.timeout = XR_INFINITE_DURATION;
+                m_xrWaitSwapchainImage(m_injectionSwapchain, &waitInfo);
+            }
+            if (m_xrReleaseSwapchainImage) {
+                XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                m_xrReleaseSwapchainImage(m_injectionSwapchain, &releaseInfo);
+            }
+
+            // Reuse the same projection structure as SubmitSlotImage.
+            XrSwapchainSubImage subImage{};
+            subImage.swapchain        = m_injectionSwapchain;
+            subImage.imageArrayIndex  = 0;
+            subImage.imageRect.offset = {0, 0};
+            subImage.imageRect.extent = {static_cast<int32_t>(m_imageWidth),
+                                         static_cast<int32_t>(m_imageHeight)};
+
+            XrPosef identityPose{};
+            identityPose.orientation = {0.f, 0.f, 0.f, 1.f};
+
+            XrCompositionLayerProjectionView projView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+            projView.subImage = subImage;
+            projView.pose     = identityPose;
+            projView.fov      = {-0.7854f, 0.7854f, 0.7854f, -0.7854f};
+
+            XrCompositionLayerProjection projLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+            projLayer.space     = m_localSpace;
+            projLayer.viewCount = 1;
+            projLayer.views     = &projView;
+
+            const XrCompositionLayerBaseHeader* layers[] = {
+                reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projLayer)
+            };
+
+            XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+            endInfo.displayTime          = displayTime;
+            endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+            endInfo.layerCount           = 1;
+            endInfo.layers               = layers;
+            m_api.xrEndFrame(m_session, &endInfo);
+            return;
+        }
+    }
+
+    // True fallback: injection swapchain not yet available.
     XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime          = displayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
