@@ -170,10 +170,14 @@ void RuntimeThread::ThreadBody() {
         }
 
         // ---- Path A / Path B decision ----
+        ++m_rtFrameCount;
         auto slot = m_holdingPen.ConsumeLatest();
         if (slot.has_value()) {
             // Path A: fresh frame available.
             m_consecutivePathBCount = 0;
+            if (m_rtFrameCount <= 5 || m_rtFrameCount % 90 == 0) {
+                Log(fmt::format("RuntimeThread: frame {} — Path A (slot image)\n", m_rtFrameCount));
+            }
             // Pass the consumed fence so it fires when the GPU finishes the blit,
             // not via a separate CPU-side empty submit. This prevents the app thread
             // from reusing the slot image while the runtime thread's blit is in-flight.
@@ -187,6 +191,10 @@ void RuntimeThread::ThreadBody() {
             // Path B: deadline miss.
             ++m_consecutivePathBCount;
 
+            if (m_rtFrameCount <= 5 || m_rtFrameCount % 90 == 0) {
+                Log(fmt::format("RuntimeThread: frame {} — Path B (no slot, consecutiveB={})\n",
+                                m_rtFrameCount, m_consecutivePathBCount));
+            }
             if (m_consecutivePathBCount > 10) {
                 // App appears stalled — black frame to avoid smearing.
                 SubmitBlackFrame(frameState.predictedDisplayTime);

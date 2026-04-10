@@ -165,7 +165,8 @@ class RuntimeThread {
 
     // ---- per-iteration state (runtime thread only) ----
     std::optional<HoldingPen::ReadySlot> m_lastSubmittedSlot;
-    int m_consecutivePathBCount{0};
+    int      m_consecutivePathBCount{0};
+    uint32_t m_rtFrameCount{0};
 };
 
 } // namespace openxr_api_layer
