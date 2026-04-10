@@ -35,7 +35,7 @@ NuGet dependencies: fmt, OpenXR.Headers, OpenXR.Loader, WIL (restore automatical
 ## Current Implementation Status
 
 **Implemented:**
-- **layer.cpp** — xrCreateSession, xrCreateSwapchain, xrEnumerateSwapchainImages, xrAcquireSwapchainImage, xrWaitFrame, xrEndFrame; delegates to modular frame/pose/depth helpers. Runtime behavior still pass-through at final submission.
+- **layer.cpp** — xrCreateSession, xrCreateSwapchain, xrEnumerateSwapchainImages, xrAcquireSwapchainImage, xrWaitSwapchainImage, xrWaitFrame, xrEndFrame, xrDestroySession, xrPollEvent; delegates to modular frame/pose/depth helpers.
 - **Item 1 — vulkan_cuda_interop** — `SharedImage` (VkImage↔CUarray) + `SharedSemaphore` (VkSemaphore↔CUexternalSemaphore). Validated by `interop-test` → **[PASS]**
 - **Item 3 — ofa_pipeline** — `OFAPipeline`: NvOF 5.0.7 dynamic load, loadFrame/execute. **NvOF FORWARD convention:** vectors give displacement inputFrame→referenceFrame (NOT reference→input). Validated by `ofa-test` → **[PASS]**
 - **Item 2 / 1.5 foundation** — `FrameContext` + `PoseProvider`: caches predicted display time from `xrWaitFrame`, populates predicted views via `xrLocateViews`, records render-view FOV/pose from projection layers.
@@ -47,6 +47,9 @@ NuGet dependencies: fmt, OpenXR.Headers, OpenXR.Loader, WIL (restore automatical
 - **Frame transport extraction** — `FrameBroker`: centralized swapchain registration, image mapping, acquired-index tracking, and current color/depth retrieval.
 - **Injection scaffolding** — `FrameInjection`: creates dedicated synthetic color swapchain and exposes readiness; recursion guard added for internal swapchain creation.
 - **Vulkan submission safety hardening** — `VulkanFrameProcessor` migrated from single command buffer to command-buffer ring + per-slot fence gating to avoid CPU/GPU re-record races.
+- **xrDestroySession** — intercepts to join `RuntimeThread` deterministically before session teardown, preventing use-after-free on session objects.
+- **xrWaitSwapchainImage** — added to dispatch intercept list; early-exits for layer-managed primary color swapchain to match the synthesized acquire/release intercepts.
+- **Private layer-owned primary color images (Phase 3A Task 4 — Complete)** — `AllocatePrivateColorImages` allocates N device-local `VkImage`s (COLOR_ATTACHMENT + TRANSFER_SRC); `xrEnumerateSwapchainImages` substitutes private images for the primary color swapchain before returning handles to the app; `xrAcquireSwapchainImage`/`xrWaitSwapchainImage`/`xrReleaseSwapchainImage` intercept primary color swapchain operations so SteamVR's real swapchain is never acquired or released from the app thread; `TeardownPhase3Resources` frees private images after `vkQueueWaitIdle` guard.
 
 **Pending (stubs/TODOs):**
 - **Item 2 integration remainder:** compute and use `pose_delta = display_pose * inverse(render_pose)` in live pre-warp path.
@@ -54,17 +57,19 @@ NuGet dependencies: fmt, OpenXR.Headers, OpenXR.Loader, WIL (restore automatical
 - **Item 10 remainder (major blocker for in-game FG):** write synthesized output into injection swapchain images and rewrite downstream projection-layer subimages in `xrEndFrame`.
 - **VulkanFrameProcessor functional pipeline:** current dispatch path is infrastructure only; OFA → stereo adaptation → pre-warp → synthesis → hole-fill still needs live wiring.
 - **EAC-safe sync migration (priority):** replace timeline-sem semaphore assumptions with binary semaphore/fence flow compatible with runtime + app ownership boundaries.
-- **Hardware queue isolation (priority):** intercept OpenXR Vulkan negotiation/session creation so runtime compositor work is redirected to graphics `queueIndex=1` while app rendering remains on `queueIndex=0`.
+- **Hardware queue isolation (next priority — confirmed crash root cause):** two threads call `vkQueueSubmit` on the same `VkQueue` handle concurrently (RT blit + app renders) — Vulkan external-sync violation; `g_queueMutex` cannot fix this because it cannot wrap the app's own submits. Three-step fix: (A) probe `vkGetDeviceQueue(device, family, index+1)` in `xrCreateSession` — zero cost, works if app requested multiple queues; (B) intercept `xrCreateVulkanDeviceKHR` to bump `queueCount` to 2 when only 1 is requested, then rewrite `queueIndex` to 1 in `xrCreateSession`; (C) if both fail (app used raw `vkCreateDevice` with 1 queue — possible for Star Citizen), proxy RT queue submissions through the app thread or force passthrough.
+- **Decoupled runtime thread (color-first):** layer-owned color images complete (Phase 3A Task 4 done). Remaining: queue isolation (prerequisite) + ring-buffer cross-thread delivery wiring. Synthesis fallback follows only after queue-isolated color-only path is stable.
 - **In-game validation pass:** verify Star Citizen runtime traces (`r_sterodepthcomposition=1`) show stable depth detection, synthesis readiness, active rewrite, and no fence starvation.
-- **Asynchronous presentation (color-first):** decouple submission from app `xrEndFrame` using a dedicated runtime thread and layer-owned color holding-pen images; enable synthesis fallback only after queue-isolated color-only path is stable.
 - **Depth reintegration (post-Phase-3):** depth copy/ownership and `XrCompositionLayerDepthInfoKHR` re-attachment are Phase 4 work, not part of initial decoupled-thread bring-up.
 - **Graceful teardown:** on `xrDestroySession`, deterministically stop decoupled thread and idle queue/device before freeing layer-owned images to avoid `vkFreeMemory while in use`.
 
 **Architecture corrections (must follow):**
 - This project outputs an **OpenXR API layer DLL** referenced by manifest `library_path`; it must **not** be named/replaced as `openxr_loader.dll`.
 - Treat OpenXR pacing semantics as strict (`xrWaitFrame -> xrBeginFrame -> xrEndFrame`) on the runtime thread; do not use naive dual-submit from a single app heartbeat.
-- Do **not** detour raw Vulkan submit/present entry points (`vkQueueSubmit`, `vkQueuePresentKHR`) for synchronization fixes; this path is EAC-risky and out-of-bounds.
+- Do **not** detour raw Vulkan submit/present entry points (`vkQueueSubmit`, `vkQueuePresentKHR`, `vkCreateDevice`) for any purpose — EAC-risky and out-of-bounds. Queue isolation must be achieved via OpenXR-level hooks (`xrCreateVulkanDeviceKHR`, `xrCreateSession`) only.
 - Decoupled runtime submission is only valid when queue isolation and capability gates succeed; otherwise force safe passthrough.
+- **Confirmed VK_ERROR_DEVICE_LOST root cause:** concurrent `vkQueueSubmit` from RuntimeThread and app thread on the same `VkQueue` handle — Vulkan external-synchronization violation. A CPU mutex cannot fix this because it cannot wrap the app's own Vulkan submit calls. Fix requires the RT to own a separate `VkQueue` handle.
+- **No timeline semaphores.** All thread-crossing GPU synchronization uses binary `VkSemaphore` + `VkFence` only.
 
 **OFA deferred optimizations (for live integration):** switch to `cuMemcpy2DAsync` (async copies); add `hostPitch` to `loadFrame()` (Vulkan stride); bypass `loadFrame()` entirely via CUDA/Vulkan interop to keep frames GPU-resident.
 

@@ -169,7 +169,15 @@ fill(VkImage frame, VkImage hole_map) -> VkImage filled_frame
 
 **Fractional Δt scaling:** motion vectors and pose warp must be scaled to runtime target `predictedDisplayTime` using actual buffered frame timestamps.
 
-**Queue model:** app rendering remains on Queue 0; runtime/compositor submission uses Queue 1 after OpenXR negotiation/session interception.
+**Confirmed crash root cause:** RT and app thread call `vkQueueSubmit` on the same `VkQueue` handle concurrently — Vulkan external-synchronization violation. `VK_ERROR_DEVICE_LOST` results. A CPU mutex cannot fix this because it cannot wrap the app's own Vulkan submit calls.
+
+**Queue isolation (three-step approach, OpenXR-level only):**
+- **Step A — probe:** in `xrCreateSession`, call `vkGetDeviceQueue(device, family, index+1, &rtQueue)`; if non-null and ≠ app queue, use it for RT. Zero cost; works when app requested multiple queues (common in AAA engines).
+- **Step B — `xrCreateVulkanDeviceKHR` interception:** if the app calls this (`XR_KHR_vulkan_enable2`), bump `queueCount` to 2; rewrite `queueIndex` to 1 in `xrCreateSession` for the RT. Star Citizen may use raw `vkCreateDevice` and never call this — probe (A) is the more likely path.
+- **Step C — fallback:** if probe returns null and the extension was never intercepted, proxy RT's `vkQueueSubmit` through the app thread, or force passthrough mode.
+- Raw Vulkan entry-point detours (`vkCreateDevice`, `vkQueueSubmit`) are not permitted — EAC risk.
+
+**Queue model:** app rendering remains on Queue 0; runtime/compositor submission uses Queue 1 after isolation is confirmed at session creation.
 
 ---
 
@@ -229,5 +237,6 @@ This is the safety net that prevents judder from propagating to the user. It sha
 | OFA latency on RTX 5070 Ti | Must fit ~4-5ms of ~11ms budget | Profile on hardware |
 | Eye tracking OpenXR extension for Pimax Dream Air | Foveated processing | Confirm at integration |
 | IPD-based stereo vector adaptation accuracy | Right-eye synthesis quality | Validate empirically |
-| Queue-index redirect compatibility across runtimes | Decoupled submission stability | Validate on SteamVR/PimaxXR |
-| Layer-owned image lifetime + teardown ordering | Avoid vkFreeMemory-in-use failures | Validate in shutdown stress |
+| Does Star Citizen call `xrCreateVulkanDeviceKHR` or raw `vkCreateDevice`? | Determines which queue isolation step fires | Verify with trace at session creation |
+| Queue-index redirect compatibility across runtimes | Decoupled submission stability | In progress — probe + `xrCreateVulkanDeviceKHR` approach |
+| Layer-owned image lifetime + teardown ordering | Avoid vkFreeMemory-in-use failures | Addressed — `vkQueueWaitIdle` guard in `TeardownPhase3Resources` |
