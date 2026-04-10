@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "hello_xr",
+      "runtimeExecutable": "C:\\Project\\OpenXR-SDK-Source\\build\\src\\tests\\hello_xr\\Debug\\hello_xr.exe",
+      "runtimeArgs": ["-g", "vulkan"],
+      "port": 0
+    }
+  ]
+}

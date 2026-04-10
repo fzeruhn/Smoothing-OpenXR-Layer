@@ -29,6 +29,8 @@
 #include "frame_broker.h"
 #include "frame_context.h"
 #include "frame_injection.h"
+#include "holding_pen.h"
+#include "runtime_thread.h"
 #include "frame_synthesizer.h"
 #include "gpu_pipeline_kernels.h"
 #include "hole_filler.h"
@@ -40,6 +42,8 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <cuda.h>
 
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -56,6 +60,17 @@
 
 
 namespace openxr_api_layer {
+
+    // Thread-local flag set to true inside the RuntimeThread's std::thread body.
+    // When true, all OpenXR hook overrides fast-path to the downstream dispatch,
+    // bypassing layer logic to prevent re-entrant frame capture or deadlocks.
+    // Pattern mirrors FrameInjection::s_creatingSwapchain.
+    thread_local bool g_isRuntimeThread = false;
+
+    // Mutex protecting the shared VkQueue. Most Vulkan apps expose only one queue,
+    // so both the app thread (HoldingPen copy submits) and the runtime thread
+    // (blit + presentation submits) must serialize their vkQueueSubmit calls.
+    std::mutex g_queueMutex;
 
     using namespace log;
 
@@ -90,6 +105,11 @@ namespace openxr_api_layer {
                                                                   uint32_t bufferCapacityInput,
                                                                   uint32_t* bufferCountOutput,
                                                                   char* buffer);
+
+    // App-thread xrBeginFrame intercept: when RuntimeThread owns pacing, return
+    // XR_SUCCESS immediately (the RuntimeThread calls the real xrBeginFrame).
+    XrResult XRAPI_CALL xrBeginFrame_intercept(XrSession session,
+                                               const XrFrameBeginInfo* frameBeginInfo);
 
     class VulkanFrameProcessor {
       public:
@@ -959,6 +979,10 @@ namespace openxr_api_layer {
                     *function = reinterpret_cast<PFN_xrVoidFunction>(xrGetVulkanDeviceExtensionsKHR_intercept);
                     return XR_SUCCESS;
                 }
+                if (strcmp(name, "xrBeginFrame") == 0) {
+                    *function = reinterpret_cast<PFN_xrVoidFunction>(xrBeginFrame_intercept);
+                    return XR_SUCCESS;
+                }
             }
 
             XrResult result = m_bypassApiLayer ? m_xrGetInstanceProcAddr(instance, name, function)
@@ -1082,8 +1106,17 @@ namespace openxr_api_layer {
             XrResult result = OpenXrApi::xrCreateSession(instance, createInfo, session);
 
             if (XR_SUCCEEDED(result) && isSystemHandled(createInfo->systemId)) {
+                // If a previous session's Phase3 resources are still alive, tear them down first.
+                if (m_session != XR_NULL_HANDLE) {
+                    TeardownPhase3Resources();
+                }
                 m_session = *session;
                 Log(fmt::format("Captured VR Session: {}\n", (void*)m_session));
+
+                PFN_xrVoidFunction beginFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrBeginFrame", &beginFn))) {
+                    m_xrBeginFrame = reinterpret_cast<PFN_xrBeginFrame>(beginFn);
+                }
 
                 PFN_xrVoidFunction waitFn = nullptr;
                 if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrWaitSwapchainImage", &waitFn))) {
@@ -1094,6 +1127,21 @@ namespace openxr_api_layer {
                 if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrReleaseSwapchainImage", &releaseFn))) {
                     m_xrReleaseSwapchainImage = reinterpret_cast<PFN_xrReleaseSwapchainImage>(releaseFn);
                 }
+
+                PFN_xrVoidFunction createRefSpaceFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrCreateReferenceSpace", &createRefSpaceFn))) {
+                    m_xrCreateReferenceSpace = reinterpret_cast<PFN_xrCreateReferenceSpace>(createRefSpaceFn);
+                }
+
+                PFN_xrVoidFunction destroySpaceFn = nullptr;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetInstanceProcAddr(instance, "xrDestroySpace", &destroySpaceFn))) {
+                    m_xrDestroySpace = reinterpret_cast<PFN_xrDestroySpace>(destroySpaceFn);
+                }
+
+                // Signal deferred construction of HoldingPen + RuntimeThread.
+                // Actual construction is deferred to first xrEndFrame once the
+                // injection swapchain and its images are available.
+                m_needHoldingPenInit = true;
             }
             return result;
         }
@@ -1157,16 +1205,52 @@ namespace openxr_api_layer {
             XrResult result =
                 OpenXrApi::xrEnumerateSwapchainImages(swapchain, imageCapacityInput, imageCountOutput, images);
 
-            if (XR_SUCCEEDED(result) && images != nullptr && m_apiType == GraphicsAPI::Vulkan) {
-                if (m_frameBroker.IsColorSwapchain(swapchain) || m_frameBroker.IsDepthSwapchain(swapchain)) {
-                    m_frameBroker.RegisterSwapchainImages(swapchain, *imageCountOutput, images);
-                    Log(fmt::format("Mapped {} Vulkan images for swapchain.\n", *imageCountOutput));
-                } else if (swapchain == m_frameInjection.Swapchain()) {
-                    const auto* vkImages = reinterpret_cast<const XrSwapchainImageVulkanKHR*>(images);
-                    m_injectionVulkanImages.clear();
-                    m_injectionVulkanImages.reserve(*imageCountOutput);
-                    for (uint32_t i = 0; i < *imageCountOutput; ++i) {
-                        m_injectionVulkanImages.push_back(vkImages[i].image);
+            if (XR_SUCCEEDED(result) && m_apiType == GraphicsAPI::Vulkan) {
+                const bool isPrimaryColor = m_frameBroker.IsColorSwapchain(swapchain) &&
+                                            swapchain == m_frameBroker.GetPrimaryColorSwapchain();
+
+                if (isPrimaryColor && images != nullptr) {
+                    // Phase 3: return layer-owned private images to the app so SteamVR's
+                    // real swapchain images are never acquired/released from the app thread.
+                    // This breaks the cycle where SteamVR holds released images indefinitely
+                    // (because our xrEndFrame never forwards), causing xrWaitSwapchainImage
+                    // to block ~1s then return XR_ERROR_SESSION_LOST.
+                    const uint32_t count = *imageCountOutput;
+                    if (m_privateColorImages.empty() && m_vkDevice != VK_NULL_HANDLE) {
+                        const auto ci = m_frameBroker.GetPrimaryColorCreateInfo();
+                        const uint32_t w   = ci ? ci->width  : m_frameBroker.GetSwapchainWidth();
+                        const uint32_t h   = ci ? ci->height : m_frameBroker.GetSwapchainHeight();
+                        const VkFormat fmt = ci ? static_cast<VkFormat>(ci->format)
+                                               : VK_FORMAT_R8G8B8A8_SRGB;
+                        if (!AllocatePrivateColorImages(count, fmt, w, h)) {
+                            Log("[WARN] Private image alloc failed — falling back to real images.\n");
+                            m_frameBroker.RegisterSwapchainImages(swapchain, count, images);
+                            Log(fmt::format("Mapped {} real Vulkan images for primary swapchain.\n", count));
+                            return result;
+                        }
+                    }
+                    // Overwrite the XrSwapchainImageVulkanKHR array the app supplied with
+                    // our private VkImages so the app renders into layer-owned memory.
+                    auto* vkImages = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
+                    for (uint32_t i = 0; i < count && i < m_privateColorImages.size(); ++i) {
+                        vkImages[i].image = m_privateColorImages[i];
+                    }
+                    // Register private images in FrameBroker (used by xrReleaseSwapchainImage).
+                    m_frameBroker.RegisterSwapchainImages(swapchain, count, images);
+                    Log(fmt::format("Primary color swapchain: returned {} PRIVATE layer-owned images.\n",
+                                    count));
+                } else if (images != nullptr) {
+                    if (m_frameBroker.IsColorSwapchain(swapchain) ||
+                        m_frameBroker.IsDepthSwapchain(swapchain)) {
+                        m_frameBroker.RegisterSwapchainImages(swapchain, *imageCountOutput, images);
+                        Log(fmt::format("Mapped {} Vulkan images for swapchain.\n", *imageCountOutput));
+                    } else if (swapchain == m_frameInjection.Swapchain()) {
+                        const auto* vkImages = reinterpret_cast<const XrSwapchainImageVulkanKHR*>(images);
+                        m_injectionVulkanImages.clear();
+                        m_injectionVulkanImages.reserve(*imageCountOutput);
+                        for (uint32_t i = 0; i < *imageCountOutput; ++i) {
+                            m_injectionVulkanImages.push_back(vkImages[i].image);
+                        }
                     }
                 }
             }
@@ -1177,14 +1261,185 @@ namespace openxr_api_layer {
         XrResult xrAcquireSwapchainImage(XrSwapchain swapchain,
                                          const XrSwapchainImageAcquireInfo* acquireInfo,
                                          uint32_t* index) override {
+            // RuntimeThread calls this on the synthetic swapchain — bypass layer logic
+            // to prevent re-entrant frame capture that would deadlock or corrupt state.
+            if (g_isRuntimeThread) {
+                return OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
+            }
+            // Private color swapchain: synthesize acquire index, do NOT call SteamVR.
+            // SteamVR has no knowledge of this swapchain being acquired, so it will
+            // never block waiting for an xrEndFrame to recycle the image.
+            if (!m_privateColorImages.empty() &&
+                m_frameBroker.IsColorSwapchain(swapchain) &&
+                swapchain == m_frameBroker.GetPrimaryColorSwapchain()) {
+                *index = m_privateAcquireIndex %
+                         static_cast<uint32_t>(m_privateColorImages.size());
+                ++m_privateAcquireIndex;
+                m_frameBroker.OnAcquireSwapchainImage(swapchain, *index);
+                return XR_SUCCESS;
+            }
             XrResult result = OpenXrApi::xrAcquireSwapchainImage(swapchain, acquireInfo, index);
             if (XR_SUCCEEDED(result)) {
-                m_frameBroker.OnAcquireSwapchainImage(swapchain, *index); // Remember this index for EndFrame
+                m_frameBroker.OnAcquireSwapchainImage(swapchain, *index);
             }
             return result;
         }
 
+        // HOOK WAIT SWAPCHAIN IMAGE — private color swapchain images are always ready.
+        // For the real swapchain this blocks until SteamVR finishes reading the image
+        // from the previous frame.  For our layer-owned images there is no compositor
+        // involvement, so return XR_SUCCESS immediately.
+        XrResult xrWaitSwapchainImage(XrSwapchain swapchain,
+                                      const XrSwapchainImageWaitInfo* waitInfo) override {
+            if (g_isRuntimeThread) {
+                return OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo);
+            }
+            if (!m_privateColorImages.empty() &&
+                m_frameBroker.IsColorSwapchain(swapchain) &&
+                swapchain == m_frameBroker.GetPrimaryColorSwapchain()) {
+                return XR_SUCCESS;
+            }
+            return OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo);
+        }
+
+        // 2.6. HOOK SWAPCHAIN RELEASE — copy app image before SteamVR takes ownership
+        // The app's color swapchain image is in COLOR_ATTACHMENT_OPTIMAL here, and
+        // we own it. After the real xrReleaseSwapchainImage returns, SteamVR may
+        // queue a GPU layout transition on its compositor queue. Submitting our copy
+        // AFTER that point means our barrier declares the wrong oldLayout → device
+        // lost. Doing it HERE, before the release, guarantees correct ownership and
+        // layout. The GPU copy completes before SteamVR's compositor reads the image
+        // (~11ms window vs microseconds for a memcpy-sized GPU blit).
+        XrResult xrReleaseSwapchainImage(XrSwapchain swapchain,
+                                          const XrSwapchainImageReleaseInfo* releaseInfo) override {
+            const bool isPrimaryColor = !m_privateColorImages.empty() &&
+                                        m_frameBroker.IsColorSwapchain(swapchain) &&
+                                        swapchain == m_frameBroker.GetPrimaryColorSwapchain();
+
+            if (!g_isRuntimeThread && isPrimaryColor) {
+                // Copy into the HoldingPen if Phase 3 is active.
+                if (m_holdingPen && m_holdingPenActive) {
+                    VkImage colorImage = m_frameBroker.GetCurrentImageForSwapchain(swapchain);
+                    if (colorImage != VK_NULL_HANDLE) {
+                        XrPosef pose{};
+                        pose.orientation = {0.f, 0.f, 0.f, 1.f};
+                        if (m_frameContext.renderViews[0].valid) {
+                            pose = m_frameContext.renderViews[0].pose;
+                        }
+                        const XrTime displayTime =
+                            m_runtimeThread ? m_runtimeThread->GetLastDisplayTime() : 0;
+                        m_holdingPen->SubmitCopy(colorImage,
+                                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                                  displayTime, pose);
+                    }
+                }
+                // Private swapchain: SteamVR never acquired this image, so do NOT forward
+                // to xrReleaseSwapchainImage — there is nothing for SteamVR to release.
+                return XR_SUCCESS;
+            }
+            return OpenXrApi::xrReleaseSwapchainImage(swapchain, releaseInfo);
+        }
+
+        // 2.5. HOOK SESSION DESTROY
+        // Must stop the RuntimeThread before the session handle becomes invalid.
+        // If we don't join here, the RuntimeThread is inside xrWaitFrame when
+        // Log xrEndSession so we can tell whether hello_xr went through the
+        // normal STOPPING state (xrEndSession called) vs. destructor-path exit.
+        XrResult xrEndSession(XrSession session) override {
+            Log(fmt::format("xrEndSession called (session={})\n", (void*)session));
+            return OpenXrApi::xrEndSession(session);
+        }
+
+        // Intercept xrLocateViews + xrSyncActions to catch session-error returns
+        // that cause hello_xr to throw (via CHECK_XRCMD) before any of our
+        // other hooks are reached — which is why xrDestroySession appears without
+        // a prior xrReleaseSwapchainImage or xrEndFrame in the log.
+        XrResult xrLocateViews(XrSession session,
+                               const XrViewLocateInfo* viewLocateInfo,
+                               XrViewState* viewState,
+                               uint32_t viewCapacityInput,
+                               uint32_t* viewCountOutput,
+                               XrView* views) override {
+            XrResult result = OpenXrApi::xrLocateViews(
+                session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
+            if (result != XR_SUCCESS) {
+                Log(fmt::format("xrLocateViews returned {} (session={})\n",
+                                result, (void*)session));
+            }
+            return result;
+        }
+
+        XrResult xrSyncActions(XrSession session,
+                               const XrActionsSyncInfo* syncInfo) override {
+            XrResult result = OpenXrApi::xrSyncActions(session, syncInfo);
+            if (result != XR_SUCCESS && result != XR_SESSION_NOT_FOCUSED) {
+                Log(fmt::format("xrSyncActions returned {} (session={})\n",
+                                result, (void*)session));
+            }
+            return result;
+        }
+
+        // SteamVR frees the internal session object → AV at session->field_0x30.
+        XrResult xrDestroySession(XrSession session) override {
+            if (session == m_session) {
+                Log("xrDestroySession: tearing down Phase3 resources before destroy.\n");
+                TeardownPhase3Resources();
+                m_session = XR_NULL_HANDLE;
+            }
+            return OpenXrApi::xrDestroySession(session);
+        }
+
         XrResult xrWaitFrame(XrSession session, const XrFrameWaitInfo* frameWaitInfo, XrFrameState* frameState) override {
+            // RuntimeThread calls this with g_isRuntimeThread=true — go straight to compositor.
+            if (g_isRuntimeThread) {
+                return OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
+            }
+
+            if (session == m_session && frameState) {
+                // Phase 3 active: RuntimeThread is the sole caller of the real compositor
+                // xrWaitFrame. Block until it has called xrBeginFrame, then return a
+                // synthetic XrFrameState. WaitForBeginFrame() is safe to call because
+                // RuntimeThread stores lastTime BEFORE signalling the condvar.
+                if (m_runtimeThread && m_holdingPenActive) {
+                    m_runtimeThread->WaitForBeginFrame();
+
+                    const int64_t lastTime = m_runtimeThread->GetLastDisplayTime();
+                    const int64_t period   = m_runtimeThread->GetDisplayPeriod();
+
+                    frameState->type                   = XR_TYPE_FRAME_STATE;
+                    frameState->next                   = nullptr;
+                    frameState->predictedDisplayTime   = lastTime + period;
+                    frameState->predictedDisplayPeriod = period;
+                    frameState->shouldRender           = XR_TRUE;
+                    m_poseProvider.OnWaitFrame(*frameState);
+                    return XR_SUCCESS;
+                }
+
+                // Phase 3 pending (HoldingPen not yet constructed): synthesize dummy
+                // timing so the app NEVER calls the real compositor xrWaitFrame.
+                // The real xrWaitFrame will be called exclusively by RuntimeThread once
+                // it starts. Using a real call here would leave an orphaned compositor
+                // frame slot that RuntimeThread can never close, causing a protocol
+                // violation and session termination.
+                if (m_needHoldingPenInit) {
+                    constexpr int64_t kFallbackPeriodNs = 11'111'111LL; // ~90 Hz
+                    // Keep predictedDisplayTime monotonically increasing across
+                    // repeated calls; a constant value breaks apps that rely on it.
+                    if (m_syntheticDisplayTime == 0)
+                        m_syntheticDisplayTime = kFallbackPeriodNs * 2;
+                    else
+                        m_syntheticDisplayTime += kFallbackPeriodNs;
+                    frameState->type                   = XR_TYPE_FRAME_STATE;
+                    frameState->next                   = nullptr;
+                    frameState->predictedDisplayTime   = m_syntheticDisplayTime;
+                    frameState->predictedDisplayPeriod = kFallbackPeriodNs;
+                    frameState->shouldRender           = XR_TRUE;
+                    m_poseProvider.OnWaitFrame(*frameState);
+                    return XR_SUCCESS;
+                }
+            }
+
+            // Pre-Phase-3 (no session yet, or session mismatch) — real call.
             XrResult result = OpenXrApi::xrWaitFrame(session, frameWaitInfo, frameState);
             if (XR_SUCCEEDED(result) && session == m_session && frameState && frameState->type == XR_TYPE_FRAME_STATE) {
                 m_poseProvider.OnWaitFrame(*frameState);
@@ -1194,6 +1449,11 @@ namespace openxr_api_layer {
 
         // 4. HOOK END FRAME (The trigger to copy the data)
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
+            // RuntimeThread calls xrEndFrame on the compositor's behalf — bypass layer
+            // logic entirely to avoid re-entrant frame capture or infinite recursion.
+            if (g_isRuntimeThread) {
+                return OpenXrApi::xrEndFrame(session, frameEndInfo);
+            }
             if (session == m_session && m_apiType == GraphicsAPI::Vulkan) {
                 m_frameContext = FrameContext{};
                 const XrCompositionLayerProjection* projectionLayer = nullptr;
@@ -1273,214 +1533,226 @@ namespace openxr_api_layer {
                     }
                 }
 
-                VkImage currentColor = m_frameBroker.GetCurrentColorImage();
-                VkImage currentDepth = VK_NULL_HANDLE;
+                // Phase 3: the app thread never touches the real compositor.
+                // Copies are submitted to the HoldingPen in xrReleaseSwapchainImage
+                // (before image ownership transfers to SteamVR). RuntimeThread owns
+                // all xrEndFrame submissions.
+                EnsureHoldingPenAndRuntimeThread();
 
-                // 2. Grab Current Depth (prefer depth chained on projection views)
-                if (m_frameContext.depthViews[0].valid) {
-                    currentDepth = m_frameContext.depthViews[0].image;
-                } else if (m_frameContext.depthViews[1].valid) {
-                    currentDepth = m_frameContext.depthViews[1].image;
-                } else {
-                    currentDepth = m_frameBroker.GetCurrentDepthImage();
-                }
-
-                // 3. Process if we have a previous frame!
-                if (m_processor && currentColor && currentDepth && m_prevColor && m_prevDepth) {
-                    m_processor->PollCompletedWork();
-
-                    // TODO (Item 4): Pre-OFA pose pre-warp
-                    // When Item 2 (Pose Data Pipeline) is complete:
-                    //   1. Extract XrPosef render_pose and display_pose from frameEndInfo projection layers
-                    //   2. Compute pose_delta = display_pose * inverse(render_pose)
-                    //   3. Extract rotation quaternion from pose_delta
-                    //   4. Compute homography from rotation and m_fovLeft (using pose_warp_math::computeIntrinsics)
-                    //   5. Create temporary CUarrays from m_prevColor via Vulkan/CUDA interop
-                    //   6. Call m_poseWarper->warp() to apply homography to m_prevColor
-                    //   7. Feed warped frame to OFA (when OFA integration is complete)
-                    // This removes camera rotation from the motion field, improving OFA quality.
-
-                    // Dispatch to GPU. Do NOT wait for idle.
-                    const bool submitted = m_processor->ProcessFrames(
-                        currentColor,
-                        currentDepth,
-                        m_prevColor,
-                        m_prevDepth,
-                        m_frameBroker.GetSwapchainWidth(),
-                        m_frameBroker.GetSwapchainHeight());
-                    (void)submitted;
-                    if (m_processor->HasFullyValidOutput()) {
-                        m_synthesizedColor = m_processor->GetLatestOutputImage();
-                        m_hasSynthesisOutput = true;
-
-                        const auto& stageValidity = m_processor->GetLatestStageValidity();
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Synthesis_Stage_Validity",
-                                          TLArg(stageValidity.preWarp, "PreWarp"),
-                                          TLArg(stageValidity.ofa, "OFA"),
-                                          TLArg(stageValidity.depthLinearization, "DepthLinearization"),
-                                          TLArg(stageValidity.stereoAdaptation, "StereoAdaptation"),
-                                          TLArg(stageValidity.synthesis, "Synthesis"),
-                                          TLArg(stageValidity.holeFill, "HoleFill"),
-                                          TLArg(stageValidity.FullyValid(), "FullyValid"));
-                    } else {
-                        const auto& stageValidity = m_processor->GetLatestStageValidity();
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Synthesis_Stage_Validity",
-                                          TLArg(stageValidity.preWarp, "PreWarp"),
-                                          TLArg(stageValidity.ofa, "OFA"),
-                                          TLArg(stageValidity.depthLinearization, "DepthLinearization"),
-                                          TLArg(stageValidity.stereoAdaptation, "StereoAdaptation"),
-                                          TLArg(stageValidity.synthesis, "Synthesis"),
-                                          TLArg(stageValidity.holeFill, "HoleFill"),
-                                          TLArg(stageValidity.FullyValid(), "FullyValid"),
-                                          TLArg(m_processor->IsLivePipelineReady(), "LivePipelineReady"),
-                                          TLArg(m_processor->GetLastPipelineFailureReason(), "FailureReason"));
-                    }
-
-                    if (m_processor->GetFenceBusyCount() >= VulkanFrameProcessor::kCommandBufferRingSize) {
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Synthesis_Fence_Starvation",
-                                          TLArg(m_processor->GetFenceBusyCount(), "BusyStreak"));
-                    }
-                }
-
-                // TODO: When OFA pipeline is integrated, invoke stereo vector adaptation here.
-                // Note: current StereoVectorAdapter::adapt() performs cudaDeviceSynchronize();
-                // hot-path integration should use a stream-based API to avoid CPU blocking.
-
-                // 4. Update our history buffers for the NEXT frame (t-1)
-                m_prevColor = currentColor;
-                m_prevDepth = currentDepth;
-
-                TraceLoggingWrite(g_traceProvider,
-                                  "Frame_Broker_State",
-                                  TLArg(currentColor != VK_NULL_HANDLE, "HasColor"),
-                                  TLArg(currentDepth != VK_NULL_HANDLE, "HasDepth"),
-                                  TLArg(m_hasSynthesisOutput, "HasSynthesisOutput"));
-            }
-
-            const XrFrameEndInfo* submitFrameEndInfo = frameEndInfo;
-            XrFrameEndInfo frameEndInfoCopy{};
-            std::vector<const XrCompositionLayerBaseHeader*> layerPointers;
-            std::vector<XrCompositionLayerProjection> projectionLayerCopies;
-            std::vector<std::vector<XrCompositionLayerProjectionView>> projectionViewCopies;
-
-            if (m_enableFrameRewrite && session == m_session && m_apiType == GraphicsAPI::Vulkan && frameEndInfo != nullptr &&
-                frameEndInfo->type == XR_TYPE_FRAME_END_INFO && frameEndInfo->layerCount > 0 && m_frameInjection.IsReady()) {
-                uint32_t injectionIndex = 0;
-                bool shouldRewrite = false;
-                bool acquiredInjectionImage = false;
-
-                bool synthesisReady = m_hasSynthesisOutput && m_synthesizedColor != VK_NULL_HANDLE && m_processor != nullptr;
-                if (!synthesisReady) {
+                if (m_holdingPen && m_holdingPenActive) {
                     TraceLoggingWrite(g_traceProvider,
-                                      "Frame_Rewrite_Skipped",
-                                      TLArg("NoCompletedOutputYet", "Reason"),
-                                      TLArg(m_processor ? m_processor->GetLastPipelineFailureReason() : "", "PipelineFailureReason"));
-                }
-
-                if (synthesisReady && m_xrWaitSwapchainImage != nullptr && m_xrReleaseSwapchainImage != nullptr) {
-                    const XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-                    const XrResult acquireResult = OpenXrApi::xrAcquireSwapchainImage(m_frameInjection.Swapchain(), &acquireInfo, &injectionIndex);
-                    if (XR_SUCCEEDED(acquireResult)) {
-                        acquiredInjectionImage = true;
-                        const XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, nullptr, XR_INFINITE_DURATION};
-                        const XrResult waitResult = m_xrWaitSwapchainImage(m_frameInjection.Swapchain(), &waitInfo);
-                        if (XR_SUCCEEDED(waitResult)) {
-                            if (injectionIndex < m_injectionVulkanImages.size()) {
-                                const VkImage sourceColor = m_synthesizedColor;
-                                const VkImage injectionColor = m_injectionVulkanImages[injectionIndex];
-                                shouldRewrite = sourceColor != VK_NULL_HANDLE && injectionColor != VK_NULL_HANDLE &&
-                                                m_processor->CopyColorImage(sourceColor,
-                                                                           injectionColor,
-                                                                           m_frameBroker.GetSwapchainWidth(),
-                                                                           m_frameBroker.GetSwapchainHeight());
-                                if (!shouldRewrite) {
-                                    TraceLoggingWrite(g_traceProvider,
-                                                      "Frame_Rewrite_Skipped",
-                                                      TLArg("CopyFailed", "Reason"));
-                                }
-                            } else {
-                                TraceLoggingWrite(g_traceProvider,
-                                                  "Frame_Rewrite_Skipped",
-                                                  TLArg("InjectionIndexOutOfRange", "Reason"));
-                            }
-                        } else {
-                            TraceLoggingWrite(g_traceProvider,
-                                              "Frame_Rewrite_Skipped",
-                                              TLArg("WaitFailed", "Reason"),
-                                              TLArg(xr::ToCString(waitResult), "Result"));
-                        }
-                    } else {
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Frame_Rewrite_Skipped",
-                                          TLArg("AcquireFailed", "Reason"),
-                                          TLArg(xr::ToCString(acquireResult), "Result"));
-                    }
-                }
-
-                if (acquiredInjectionImage) {
-                    const XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                    const XrResult releaseResult = m_xrReleaseSwapchainImage(m_frameInjection.Swapchain(), &releaseInfo);
-                    if (XR_FAILED(releaseResult)) {
-                        shouldRewrite = false;
-                        TraceLoggingWrite(g_traceProvider,
-                                          "Injection_Release_Failed",
-                                          TLArg(xr::ToCString(releaseResult), "Result"));
-                    }
-                }
-
-                if (shouldRewrite) {
-                    projectionLayerCopies.reserve(frameEndInfo->layerCount);
-                    projectionViewCopies.reserve(frameEndInfo->layerCount);
-                    layerPointers.reserve(frameEndInfo->layerCount);
-
-                    for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
-                        const XrCompositionLayerBaseHeader* baseLayer = frameEndInfo->layers[i];
-                        if (baseLayer != nullptr && baseLayer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-                            const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(baseLayer);
-                            projectionLayerCopies.push_back(*projection);
-                            projectionViewCopies.emplace_back();
-                            auto& viewsCopy = projectionViewCopies.back();
-                            viewsCopy.resize(projection->viewCount);
-                            if (projection->viewCount > 0 && projection->views != nullptr) {
-                                std::copy_n(projection->views, projection->viewCount, viewsCopy.begin());
-                            }
-
-                            auto& projectionCopy = projectionLayerCopies.back();
-                            for (uint32_t viewIndex = 0; viewIndex < projection->viewCount; ++viewIndex) {
-                                auto& view = viewsCopy[viewIndex];
-                                view.subImage.swapchain = m_frameInjection.Swapchain();
-                                view.subImage.imageArrayIndex = projection->views[viewIndex].subImage.imageArrayIndex;
-                                view.subImage.imageRect = projection->views[viewIndex].subImage.imageRect;
-                            }
-                            projectionCopy.views = viewsCopy.data();
-                            layerPointers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionCopy));
-                        } else {
-                            layerPointers.push_back(baseLayer);
-                        }
-                    }
-
-                    frameEndInfoCopy = *frameEndInfo;
-                    frameEndInfoCopy.layers = layerPointers.data();
-                    submitFrameEndInfo = &frameEndInfoCopy;
-                }
-
-                if (m_hasSynthesisOutput && m_synthesizedColor != VK_NULL_HANDLE) {
-                    TraceLoggingWrite(g_traceProvider,
-                                      "Frame_Injection_Ready",
-                                      TLArg(m_frameInjection.IsReady(), "InjectionSwapchainReady"),
-                                      TLArg(true, "SynthesisReady"));
+                                      "HoldingPen_CopySubmitted",
+                                      TLArg(true, "HasColor"),
+                                      TLArg(frameEndInfo ? frameEndInfo->displayTime : 0LL, "DisplayTime"));
+                    return XR_SUCCESS;
                 }
             }
 
-            // Finally, pass it back to the OpenXR runtime so it gets to the headset
-            return OpenXrApi::xrEndFrame(session, submitFrameEndInfo);
+            // Fallback: Phase 3 not yet initialized — pass through.
+            return OpenXrApi::xrEndFrame(session, frameEndInfo);
         }
 
 
+        // Allocate N layer-owned color images returned to the app instead of SteamVR's
+        // real swapchain images.  Must be called with a valid m_vkDevice.
+        bool AllocatePrivateColorImages(uint32_t count, VkFormat fmt, uint32_t w, uint32_t h) {
+            m_privateColorImages.assign(count, VK_NULL_HANDLE);
+            m_privateColorMemories.assign(count, VK_NULL_HANDLE);
+
+            // Free any partially-allocated resources on failure.
+            auto cleanup = [&]() {
+                for (uint32_t j = 0; j < count; ++j) {
+                    if (m_privateColorImages[j] != VK_NULL_HANDLE)
+                        vkDestroyImage(m_vkDevice, m_privateColorImages[j], nullptr);
+                    if (m_privateColorMemories[j] != VK_NULL_HANDLE)
+                        vkFreeMemory(m_vkDevice, m_privateColorMemories[j], nullptr);
+                }
+                m_privateColorImages.clear();
+                m_privateColorMemories.clear();
+            };
+
+            VkPhysicalDeviceMemoryProperties memProps{};
+            vkGetPhysicalDeviceMemoryProperties(m_vkPhysicalDevice, &memProps);
+
+            for (uint32_t i = 0; i < count; ++i) {
+                VkImageCreateInfo imageCI{};
+                imageCI.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+                imageCI.imageType     = VK_IMAGE_TYPE_2D;
+                imageCI.format        = fmt;
+                imageCI.extent        = {w, h, 1};
+                imageCI.mipLevels     = 1;
+                imageCI.arrayLayers   = 1;
+                imageCI.samples       = VK_SAMPLE_COUNT_1_BIT;
+                imageCI.tiling        = VK_IMAGE_TILING_OPTIMAL;
+                imageCI.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                imageCI.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+                imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+                VkResult vr = vkCreateImage(m_vkDevice, &imageCI, nullptr,
+                                             &m_privateColorImages[i]);
+                if (vr != VK_SUCCESS) {
+                    Log(fmt::format("[ERROR] AllocatePrivateColorImages: vkCreateImage failed "
+                                    "(i={}, VkResult={})\n", i, static_cast<int>(vr)));
+                    cleanup();
+                    return false;
+                }
+
+                VkMemoryRequirements memReqs{};
+                vkGetImageMemoryRequirements(m_vkDevice, m_privateColorImages[i], &memReqs);
+
+                uint32_t memTypeIndex = UINT32_MAX;
+                for (uint32_t t = 0; t < memProps.memoryTypeCount; ++t) {
+                    if ((memReqs.memoryTypeBits & (1u << t)) &&
+                        (memProps.memoryTypes[t].propertyFlags &
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                        memTypeIndex = t;
+                        break;
+                    }
+                }
+                if (memTypeIndex == UINT32_MAX) {
+                    Log("[ERROR] AllocatePrivateColorImages: no device-local memory type\n");
+                    cleanup();
+                    return false;
+                }
+
+                VkMemoryAllocateInfo allocInfo{};
+                allocInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                allocInfo.allocationSize  = memReqs.size;
+                allocInfo.memoryTypeIndex = memTypeIndex;
+
+                vr = vkAllocateMemory(m_vkDevice, &allocInfo, nullptr,
+                                       &m_privateColorMemories[i]);
+                if (vr != VK_SUCCESS) {
+                    Log(fmt::format("[ERROR] AllocatePrivateColorImages: vkAllocateMemory failed "
+                                    "(i={}, VkResult={})\n", i, static_cast<int>(vr)));
+                    cleanup();
+                    return false;
+                }
+
+                vr = vkBindImageMemory(m_vkDevice, m_privateColorImages[i],
+                                        m_privateColorMemories[i], 0);
+                if (vr != VK_SUCCESS) {
+                    Log(fmt::format("[ERROR] AllocatePrivateColorImages: vkBindImageMemory failed "
+                                    "(i={}, VkResult={})\n", i, static_cast<int>(vr)));
+                    cleanup();
+                    return false;
+                }
+            }
+            Log(fmt::format("AllocatePrivateColorImages: {} private images {}x{} fmt={}\n",
+                             count, w, h, static_cast<int>(fmt)));
+            return true;
+        }
+
+        // Phase 3 teardown — called from xrCreateSession (re-create path) and destructor.
+        void TeardownPhase3Resources() {
+            Log("TeardownPhase3Resources: shutting down RuntimeThread and HoldingPen.\n");
+            m_holdingPenActive = false;
+            if (m_runtimeThread) {
+                m_runtimeThread->RequestShutdownAndJoin();
+                m_runtimeThread.reset();
+            }
+            if (m_holdingPen) {
+                m_holdingPen->DrainAndDestroy();
+                m_holdingPen.reset();
+            }
+            if (m_localSpace != XR_NULL_HANDLE && m_xrDestroySpace) {
+                m_xrDestroySpace(m_localSpace);
+                m_localSpace = XR_NULL_HANDLE;
+            }
+            m_processor.reset();
+            // Destroy private color images (must be after GPU is idle — HoldingPen
+            // DrainAndDestroy above calls vkQueueWaitIdle, so we're safe here).
+            if (m_vkDevice != VK_NULL_HANDLE) {
+                for (uint32_t i = 0; i < static_cast<uint32_t>(m_privateColorImages.size()); ++i) {
+                    if (m_privateColorImages[i] != VK_NULL_HANDLE) {
+                        vkDestroyImage(m_vkDevice, m_privateColorImages[i], nullptr);
+                    }
+                    if (m_privateColorMemories[i] != VK_NULL_HANDLE) {
+                        vkFreeMemory(m_vkDevice, m_privateColorMemories[i], nullptr);
+                    }
+                }
+            }
+            m_privateColorImages.clear();
+            m_privateColorMemories.clear();
+            m_privateAcquireIndex = 0;
+            m_syntheticDisplayTime = 0;
+            m_session = XR_NULL_HANDLE;
+            m_needHoldingPenInit = false;
+        }
+
       private:
+        // Deferred construction: called from xrEndFrame once the injection swapchain
+        // and its images are enumerated. Safe to call every frame — exits immediately
+        // once initialized.
+        void EnsureHoldingPenAndRuntimeThread() {
+            if (!m_needHoldingPenInit || m_holdingPen) return;
+            if (!m_frameInjection.IsReady()) return;
+            if (m_injectionVulkanImages.empty()) return;
+            if (m_vkDevice == VK_NULL_HANDLE) return;
+
+            const uint32_t w = m_frameBroker.GetSwapchainWidth();
+            const uint32_t h = m_frameBroker.GetSwapchainHeight();
+            if (w == 0 || h == 0) return;
+
+            const auto infoOpt = m_frameBroker.GetPrimaryColorCreateInfo();
+            if (!infoOpt) return;
+            const VkFormat fmt = static_cast<VkFormat>(infoOpt->format);
+
+            VkQueue queue = VK_NULL_HANDLE;
+            vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &queue);
+            if (queue == VK_NULL_HANDLE) return;
+
+            // Create the local XrSpace used by RuntimeThread for projection layers.
+            XrReferenceSpaceCreateInfo spaceCI{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+            spaceCI.referenceSpaceType     = XR_REFERENCE_SPACE_TYPE_LOCAL;
+            spaceCI.poseInReferenceSpace   = {{0.f, 0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}};
+            if (!m_xrCreateReferenceSpace ||
+                XR_FAILED(m_xrCreateReferenceSpace(m_session, &spaceCI, &m_localSpace))) {
+                Log("[ERROR] EnsureHoldingPenAndRuntimeThread: xrCreateReferenceSpace failed.\n");
+                return;
+            }
+
+            try {
+                m_holdingPen = std::make_unique<HoldingPen>(
+                    m_vkPhysicalDevice, m_vkDevice,
+                    queue, m_vkQueueFamilyIndex, m_vkQueueFamilyIndex,
+                    w, h, fmt);
+
+                m_runtimeThread = std::make_unique<RuntimeThread>(
+                    *this, m_session,
+                    *m_holdingPen,
+                    m_frameInjection.Swapchain(),
+                    m_injectionVulkanImages,
+                    m_localSpace,
+                    m_vkDevice,
+                    queue,
+                    m_vkQueueFamilyIndex,
+                    w, h,
+                    m_xrBeginFrame,
+                    m_xrWaitSwapchainImage,
+                    m_xrReleaseSwapchainImage);
+
+                m_needHoldingPenInit = false;
+                m_holdingPenActive   = true;
+                Log(fmt::format(
+                    "HoldingPen + RuntimeThread initialized: {}x{} fmt={}\n", w, h, (int)fmt));
+                TraceLoggingWrite(g_traceProvider,
+                                  "Phase3_Initialized",
+                                  TLArg(w, "Width"),
+                                  TLArg(h, "Height"),
+                                  TLArg((int)fmt, "Format"));
+            } catch (const std::exception& e) {
+                Log(fmt::format("[ERROR] EnsureHoldingPenAndRuntimeThread: {}\n", e.what()));
+                m_holdingPen.reset();
+                m_runtimeThread.reset();
+                if (m_localSpace != XR_NULL_HANDLE && m_xrDestroySpace) {
+                    m_xrDestroySpace(m_localSpace);
+                    m_localSpace = XR_NULL_HANDLE;
+                }
+            }
+        }
+
         void EnsureInjectionSwapchainImagesEnumerated() {
             if (!m_frameInjection.IsReady()) {
                 return;
@@ -1535,6 +1807,14 @@ namespace openxr_api_layer {
         XrSession m_session{XR_NULL_HANDLE};
 
         std::unique_ptr<VulkanFrameProcessor> m_processor;
+        std::unique_ptr<HoldingPen>           m_holdingPen;
+        std::unique_ptr<RuntimeThread>        m_runtimeThread;
+        bool     m_needHoldingPenInit{false};
+        // Set to true in EnsureHoldingPenAndRuntimeThread immediately after the
+        // HoldingPen + RuntimeThread are constructed. Gates xrReleaseSwapchainImage
+        // copies and the synthetic xrWaitFrame RuntimeThread path.
+        bool     m_holdingPenActive{false};
+        XrSpace  m_localSpace{XR_NULL_HANDLE};
         PFN_xrGetVulkanInstanceExtensionsKHR m_xrGetVulkanInstanceExtensionsKHR{nullptr};
         PFN_xrGetVulkanDeviceExtensionsKHR m_xrGetVulkanDeviceExtensionsKHR{nullptr};
         FrameBroker m_frameBroker;
@@ -1543,9 +1823,13 @@ namespace openxr_api_layer {
         PoseProvider m_poseProvider;
         DepthProvider m_depthProvider;
         FrameContext m_frameContext{};
-        PFN_xrWaitSwapchainImage m_xrWaitSwapchainImage{nullptr};
-        PFN_xrReleaseSwapchainImage m_xrReleaseSwapchainImage{nullptr};
-        bool m_depthWarningLogged{false};
+        PFN_xrBeginFrame              m_xrBeginFrame{nullptr};
+        PFN_xrWaitSwapchainImage      m_xrWaitSwapchainImage{nullptr};
+        PFN_xrReleaseSwapchainImage   m_xrReleaseSwapchainImage{nullptr};
+        PFN_xrCreateReferenceSpace    m_xrCreateReferenceSpace{nullptr};
+        PFN_xrDestroySpace            m_xrDestroySpace{nullptr};
+        bool    m_depthWarningLogged{false};
+        int64_t m_syntheticDisplayTime{0};  // monotonic counter for fallback xrWaitFrame
         VkImage m_synthesizedColor{VK_NULL_HANDLE};
         bool m_hasSynthesisOutput{false};
 
@@ -1556,6 +1840,13 @@ namespace openxr_api_layer {
         uint32_t m_vkQueueFamilyIndex{0};
         uint32_t m_vkQueueIndex{0};
         std::vector<VkImage> m_injectionVulkanImages;
+
+        // Private color images owned by the layer — returned to the app instead of
+        // SteamVR's real swapchain images so SteamVR never holds acquired images.
+        // This prevents xrWaitSwapchainImage blocking (the root cause of session loss).
+        std::vector<VkImage>        m_privateColorImages;
+        std::vector<VkDeviceMemory> m_privateColorMemories;
+        uint32_t                    m_privateAcquireIndex{0};
 
         // NEW: History tracking for Frame Generation/Warping
         VkImage m_prevColor{VK_NULL_HANDLE};
@@ -1580,6 +1871,22 @@ namespace openxr_api_layer {
         //   4. Compute homography from pose delta and FOV (m_fovLeft/m_fovRight)
         //   5. Call m_poseWarper->warp() on m_prevColor before feeding to OFA
         // This will significantly improve OFA quality by removing camera motion from flow field.
+
+      public:
+        // Called by xrBeginFrame_intercept (free function below).
+        // In Phase 3 (pending or active), the app thread's xrBeginFrame is always a
+        // noop — RuntimeThread exclusively owns the real compositor xrBeginFrame.
+        XrResult xrBeginFrame_app(XrSession session, const XrFrameBeginInfo* frameBeginInfo) {
+            if (session == m_session && (m_runtimeThread || m_needHoldingPenInit)) {
+                // Phase 3 active or pending — app thread never touches the real compositor.
+                return XR_SUCCESS;
+            }
+            // Pre-Phase-3 path: forward the app's struct (preserves any pNext chain).
+            if (m_xrBeginFrame) {
+                return m_xrBeginFrame(session, frameBeginInfo);
+            }
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
     };
 
     XrResult XRAPI_CALL xrGetVulkanInstanceExtensionsKHR_intercept(XrInstance instance,
@@ -1604,6 +1911,15 @@ namespace openxr_api_layer {
             return XR_ERROR_RUNTIME_FAILURE;
         }
         return layer->xrGetVulkanDeviceExtensionsKHR(instance, systemId, bufferCapacityInput, bufferCountOutput, buffer);
+    }
+
+    XrResult XRAPI_CALL xrBeginFrame_intercept(XrSession session,
+                                               const XrFrameBeginInfo* frameBeginInfo) {
+        auto* layer = dynamic_cast<OpenXrLayer*>(GetInstance());
+        if (layer == nullptr) {
+            return XR_ERROR_RUNTIME_FAILURE;
+        }
+        return layer->xrBeginFrame_app(session, frameBeginInfo);
     }
 
     // This method is required by the framework to instantiate your OpenXrApi implementation.

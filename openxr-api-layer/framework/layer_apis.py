@@ -2,11 +2,17 @@
 override_functions = [
     "xrGetSystem",
     "xrCreateSession",
+    "xrDestroySession",
     "xrCreateSwapchain",
     "xrEnumerateSwapchainImages",
     "xrWaitFrame",
     "xrEndFrame",
     "xrAcquireSwapchainImage",
+    "xrWaitSwapchainImage",
+    "xrReleaseSwapchainImage",
+    "xrEndSession",
+    "xrLocateViews",
+    "xrSyncActions",
 ]
 
 # The list of OpenXR functions our layer will use from the runtime.
@@ -15,6 +21,7 @@ requested_functions = [
     "xrGetInstanceProperties",
     "xrGetSystemProperties",
     "xrLocateViews",
+    "xrSyncActions",
 ]
 
 # The list of OpenXR extensions our layer will either override or use.
