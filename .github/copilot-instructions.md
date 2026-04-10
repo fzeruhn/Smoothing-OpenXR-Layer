@@ -1,4 +1,4 @@
-# OpenXR Motion Smoothing Layer — Claude Context
+# OpenXR Motion Smoothing Layer — Copilot Context
 
 ## Session Start Checklist
 
