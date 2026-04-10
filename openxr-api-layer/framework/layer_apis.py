@@ -10,7 +10,6 @@ override_functions = [
     "xrAcquireSwapchainImage",
     "xrWaitSwapchainImage",
     "xrReleaseSwapchainImage",
-    "xrPollEvent",
     "xrEndSession",
     "xrLocateViews",
     "xrSyncActions",
