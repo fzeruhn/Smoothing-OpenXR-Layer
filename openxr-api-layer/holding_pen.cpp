@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "holding_pen.h"
+#include <log.h>
 
 #include <stdexcept>
 #include <string>
@@ -7,6 +8,8 @@
 #include <mutex>
 
 namespace openxr_api_layer {
+
+using namespace log;
 
 // Defined in layer.cpp — protects the shared VkQueue used by both threads.
 extern std::mutex g_queueMutex;
