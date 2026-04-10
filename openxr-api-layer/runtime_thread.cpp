@@ -245,7 +245,13 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
     if (m_xrWaitSwapchainImage) {
         XrSwapchainImageWaitInfo swWaitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         swWaitInfo.timeout = XR_INFINITE_DURATION;
-        m_xrWaitSwapchainImage(m_injectionSwapchain, &swWaitInfo);
+        XrResult waitResult = m_xrWaitSwapchainImage(m_injectionSwapchain, &swWaitInfo);
+        if (XR_FAILED(waitResult)) {
+            Log(fmt::format("SubmitSlotImage: xrWaitSwapchainImage failed ({})\n",
+                            static_cast<int>(waitResult)));
+            SubmitBlackFrame(displayTime);
+            return;
+        }
     }
 
     // --- Blit sourceImage → injection image ---
@@ -297,6 +303,23 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
                 sourceImage,    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 injectionImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1, &region);
+
+            // Barrier: restore source (holding pen slot) image
+            // TRANSFER_SRC_OPTIMAL → SHADER_READ_ONLY_OPTIMAL so that the next
+            // SubmitSlotImage call sees the correct oldLayout on Path B reuse.
+            VkImageMemoryBarrier restoreSrc{};
+            restoreSrc.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            restoreSrc.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+            restoreSrc.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+            restoreSrc.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            restoreSrc.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            restoreSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            restoreSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            restoreSrc.image               = sourceImage;
+            restoreSrc.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(m_blitCmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &restoreSrc);
 
             // Barrier: injection image TRANSFER_DST → COLOR_ATTACHMENT_OPTIMAL.
             // dstAccessMask=0 / BOTTOM_OF_PIPE: this is a queue-release barrier.
@@ -362,7 +385,11 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
 
     if (m_xrReleaseSwapchainImage) {
         XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        m_xrReleaseSwapchainImage(m_injectionSwapchain, &releaseInfo);
+        XrResult releaseResult = m_xrReleaseSwapchainImage(m_injectionSwapchain, &releaseInfo);
+        if (XR_FAILED(releaseResult)) {
+            Log(fmt::format("SubmitSlotImage: xrReleaseSwapchainImage failed ({})\n",
+                            static_cast<int>(releaseResult)));
+        }
     }
 
     if (!blitOk) {

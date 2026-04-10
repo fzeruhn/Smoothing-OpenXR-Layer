@@ -183,8 +183,10 @@ void HoldingPen::SubmitCopy(VkImage appColorImage,
         }
     }
     if (chosenSlot < 0) {
-        // All slots still in use — overwrite slot 0 as a fallback.
-        chosenSlot = 0;
+        // All slots in use — drop this frame rather than racing with an
+        // in-flight GPU read on slot 0.
+        Log("HoldingPen::SubmitCopy: all slots busy, dropping frame.\n");
+        return;
     }
 
     Slot& s = m_slots[chosenSlot];

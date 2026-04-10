@@ -1423,9 +1423,15 @@ namespace openxr_api_layer {
                 // violation and session termination.
                 if (m_needHoldingPenInit) {
                     constexpr int64_t kFallbackPeriodNs = 11'111'111LL; // ~90 Hz
+                    // Keep predictedDisplayTime monotonically increasing across
+                    // repeated calls; a constant value breaks apps that rely on it.
+                    if (m_syntheticDisplayTime == 0)
+                        m_syntheticDisplayTime = kFallbackPeriodNs * 2;
+                    else
+                        m_syntheticDisplayTime += kFallbackPeriodNs;
                     frameState->type                   = XR_TYPE_FRAME_STATE;
                     frameState->next                   = nullptr;
-                    frameState->predictedDisplayTime   = kFallbackPeriodNs * 2;
+                    frameState->predictedDisplayTime   = m_syntheticDisplayTime;
                     frameState->predictedDisplayPeriod = kFallbackPeriodNs;
                     frameState->shouldRender           = XR_TRUE;
                     m_poseProvider.OnWaitFrame(*frameState);
@@ -1553,6 +1559,18 @@ namespace openxr_api_layer {
             m_privateColorImages.assign(count, VK_NULL_HANDLE);
             m_privateColorMemories.assign(count, VK_NULL_HANDLE);
 
+            // Free any partially-allocated resources on failure.
+            auto cleanup = [&]() {
+                for (uint32_t j = 0; j < count; ++j) {
+                    if (m_privateColorImages[j] != VK_NULL_HANDLE)
+                        vkDestroyImage(m_vkDevice, m_privateColorImages[j], nullptr);
+                    if (m_privateColorMemories[j] != VK_NULL_HANDLE)
+                        vkFreeMemory(m_vkDevice, m_privateColorMemories[j], nullptr);
+                }
+                m_privateColorImages.clear();
+                m_privateColorMemories.clear();
+            };
+
             VkPhysicalDeviceMemoryProperties memProps{};
             vkGetPhysicalDeviceMemoryProperties(m_vkPhysicalDevice, &memProps);
 
@@ -1576,6 +1594,7 @@ namespace openxr_api_layer {
                 if (vr != VK_SUCCESS) {
                     Log(fmt::format("[ERROR] AllocatePrivateColorImages: vkCreateImage failed "
                                     "(i={}, VkResult={})\n", i, static_cast<int>(vr)));
+                    cleanup();
                     return false;
                 }
 
@@ -1593,6 +1612,7 @@ namespace openxr_api_layer {
                 }
                 if (memTypeIndex == UINT32_MAX) {
                     Log("[ERROR] AllocatePrivateColorImages: no device-local memory type\n");
+                    cleanup();
                     return false;
                 }
 
@@ -1606,6 +1626,7 @@ namespace openxr_api_layer {
                 if (vr != VK_SUCCESS) {
                     Log(fmt::format("[ERROR] AllocatePrivateColorImages: vkAllocateMemory failed "
                                     "(i={}, VkResult={})\n", i, static_cast<int>(vr)));
+                    cleanup();
                     return false;
                 }
 
@@ -1614,6 +1635,7 @@ namespace openxr_api_layer {
                 if (vr != VK_SUCCESS) {
                     Log(fmt::format("[ERROR] AllocatePrivateColorImages: vkBindImageMemory failed "
                                     "(i={}, VkResult={})\n", i, static_cast<int>(vr)));
+                    cleanup();
                     return false;
                 }
             }
@@ -1654,6 +1676,7 @@ namespace openxr_api_layer {
             m_privateColorImages.clear();
             m_privateColorMemories.clear();
             m_privateAcquireIndex = 0;
+            m_syntheticDisplayTime = 0;
             m_session = XR_NULL_HANDLE;
             m_needHoldingPenInit = false;
         }
@@ -1806,6 +1829,7 @@ namespace openxr_api_layer {
         PFN_xrCreateReferenceSpace    m_xrCreateReferenceSpace{nullptr};
         PFN_xrDestroySpace            m_xrDestroySpace{nullptr};
         bool    m_depthWarningLogged{false};
+        int64_t m_syntheticDisplayTime{0};  // monotonic counter for fallback xrWaitFrame
         VkImage m_synthesizedColor{VK_NULL_HANDLE};
         bool m_hasSynthesisOutput{false};
 
@@ -1852,15 +1876,14 @@ namespace openxr_api_layer {
         // Called by xrBeginFrame_intercept (free function below).
         // In Phase 3 (pending or active), the app thread's xrBeginFrame is always a
         // noop — RuntimeThread exclusively owns the real compositor xrBeginFrame.
-        XrResult xrBeginFrame_app(XrSession session, const XrFrameBeginInfo* /*info*/) {
+        XrResult xrBeginFrame_app(XrSession session, const XrFrameBeginInfo* frameBeginInfo) {
             if (session == m_session && (m_runtimeThread || m_needHoldingPenInit)) {
                 // Phase 3 active or pending — app thread never touches the real compositor.
                 return XR_SUCCESS;
             }
-            // Pre-Phase-3 path: call through.
+            // Pre-Phase-3 path: forward the app's struct (preserves any pNext chain).
             if (m_xrBeginFrame) {
-                XrFrameBeginInfo info{XR_TYPE_FRAME_BEGIN_INFO};
-                return m_xrBeginFrame(session, &info);
+                return m_xrBeginFrame(session, frameBeginInfo);
             }
             return XR_ERROR_RUNTIME_FAILURE;
         }
