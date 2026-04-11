@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <cstring>
+#include <chrono>
 #include <mutex>
 
 using namespace openxr_api_layer::log;
@@ -185,7 +186,8 @@ void RuntimeThread::ThreadBody() {
                             slot->image,
                             slot->copyDone,
                             slot->meta.renderPose,
-                            m_holdingPen.GetConsumedFence(slot->index));
+                            m_holdingPen.GetConsumedFence(slot->index),
+                            slot->meta.frameId);
             m_lastSubmittedSlot = slot;
         } else {
             // Path B: deadline miss.
@@ -225,7 +227,8 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
                                     VkImage sourceImage,
                                     VkSemaphore waitSemaphore,
                                     XrPosef pose,
-                                    VkFence consumedFence) {
+                                    VkFence consumedFence,
+                                    uint64_t sourceFrameId) {
     if (m_injectionSwapchain == XR_NULL_HANDLE) {
         SubmitBlackFrame(displayTime);
         return;
@@ -441,6 +444,15 @@ void RuntimeThread::SubmitSlotImage(XrTime displayTime,
     }
 
     // g_isRuntimeThread = true, so xrEndFrame fast-paths to the downstream dispatch.
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const int64_t submitNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    const uint64_t pending = m_holdingPen.GetPendingFrameCount();
+    TraceLoggingWrite(g_traceProvider,
+                      "Phase3_RuntimeSubmit",
+                      TLArg(sourceFrameId, "SourceFrameId"),
+                      TLArg(displayTime, "PredictedDisplayTime"),
+                      TLArg(submitNs, "SubmitTimestampNs"),
+                      TLArg(pending, "PendingFrames"));
     XrResult endResult = m_api.xrEndFrame(m_session, &endInfo);
     if (endResult != XR_SUCCESS) {
         Log(fmt::format("RuntimeThread::SubmitSlotImage: xrEndFrame returned {}\n", endResult));
@@ -462,7 +474,9 @@ void RuntimeThread::SubmitCachedFrame(XrTime displayTime) {
     SubmitSlotImage(displayTime,
                     m_lastSubmittedSlot->image,
                     VK_NULL_HANDLE,
-                    m_lastSubmittedSlot->meta.renderPose);
+                    m_lastSubmittedSlot->meta.renderPose,
+                    VK_NULL_HANDLE,
+                    m_lastSubmittedSlot->meta.frameId);
 }
 
 // ---------------------------------------------------------------------------

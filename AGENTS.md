@@ -174,6 +174,7 @@ bin\x64\Debug\stereo-adapter-test.exe # Stereo vector adaptation
 .\scripts\Uninstall-Layer.ps1  # Unregister
 .\scripts\Reinstall-Layer.ps1  # Uninstall+Install in one elevated pass
 ```
+**Operational rule:** For iterative testing, always use `.\scripts\Reinstall-Layer.ps1`. Do not run install-only flow, because stale prior registrations can cause mixed/ambiguous layer activation.
 Layer descriptor JSONs: `openxr-api-layer/openxr-api-layer.json` (x64) and `openxr-api-layer/openxr-api-layer-32.json` (x86).
 
 **hello_xr validation workflow (preferred for current Phase 3 work):**
@@ -184,6 +185,13 @@ Layer descriptor JSONs: `openxr-api-layer/openxr-api-layer.json` (x64) and `open
 - Baseline run is **optional** (use when comparing regressions or validating install-state assumptions), not required for every iteration.
 - Layer run: install layer, then execute the same command and compare behavior.
 - Timeout rule: do not let `hello_xr` run indefinitely in automation. If it does not exit within a reasonable window (eg. 60-90s), terminate it programmatically and treat as `TIMEOUT/HANG` for that test pass.
+- Exit-code interpretation for local manual runs:
+  - `-1073741510` (`0xC000013A`) generally indicates user interruption (Ctrl+C / Ctrl+Break), not a layer crash.
+  - `-1` in scripted timeout runs generally indicates we force-terminated the process after timeout.
+  - Fast failure with `exit=1` (especially within about a second) should be treated as a likely layer/runtime-path issue and investigated.
+- Queue-isolation expectation for `hello_xr`:
+  - `hello_xr` currently requests `XR_KHR_vulkan_enable` (not `XR_KHR_vulkan_enable2`), so `xrCreateVulkanDeviceKHR` interception/rewrite does not execute on this app path.
+  - If queue probe (`queueIndex+1`) also fails, expected gate log is `Phase3 capability gate: passthrough (source=none)`.
 - Layer log tail command:
 ```powershell
 Get-Content "$env:LOCALAPPDATA\SMOOTHING-OPENXR-LAYER\SMOOTHING-OPENXR-LAYER.log" -Tail 40

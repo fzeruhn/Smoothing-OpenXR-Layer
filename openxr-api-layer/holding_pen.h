@@ -25,6 +25,7 @@ class HoldingPen {
     static constexpr int kSlotCount = 3;
 
     struct SlotMetadata {
+        uint64_t frameId{0};
         XrTime   displayTime{0};
         XrPosef  renderPose{};  // pose at render time, used for Path B warp delta
     };
@@ -57,7 +58,7 @@ class HoldingPen {
     // Finds the oldest-consumed slot, submits a vkCmdCopyImage from appColorImage,
     // signals slot's copyDone semaphore on completion, updates m_latestReadySlot.
     // Returns immediately — no CPU wait.
-    void SubmitCopy(VkImage appColorImage,
+    bool SubmitCopy(VkImage appColorImage,
                     VkImageLayout appColorLayout,
                     XrTime displayTime,
                     XrPosef renderPose);
@@ -81,6 +82,16 @@ class HoldingPen {
 
     // Returns the warp output image (used by RuntimeThread for Path B output).
     VkImage WarpOutputImage() const { return m_warpOutputImage; }
+
+    uint64_t GetPendingFrameCount() const {
+        const uint64_t latest = m_latestSubmittedFrameId.load(std::memory_order_acquire);
+        const uint64_t consumed = m_lastConsumedFrameId.load(std::memory_order_acquire);
+        return (latest > consumed) ? (latest - consumed) : 0;
+    }
+
+    uint64_t GetDropCount() const {
+        return m_dropCount.load(std::memory_order_acquire);
+    }
 
   private:
     struct Slot {
@@ -116,6 +127,10 @@ class HoldingPen {
 
     // Set by app thread (release), read by runtime thread (acquire).
     std::atomic<int> m_latestReadySlot{-1};
+    std::atomic<uint64_t> m_latestSubmittedFrameId{0};
+    std::atomic<uint64_t> m_lastConsumedFrameId{0};
+    std::atomic<uint64_t> m_dropCount{0};
+    uint64_t m_nextFrameId{1};
     // Last slot index consumed by the runtime thread. Runtime-thread-only.
     int m_lastConsumedSlot{-1};
     // Next slot the app thread will write into. App-thread-only.

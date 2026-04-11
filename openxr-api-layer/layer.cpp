@@ -41,6 +41,7 @@
 #include <util.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -1096,6 +1097,49 @@ namespace openxr_api_layer {
                     m_vkDevice = vkBinding->device;
                     m_vkQueueFamilyIndex = vkBinding->queueFamilyIndex;
                     m_vkQueueIndex = vkBinding->queueIndex;
+                    m_vkRuntimeQueueFamilyIndex = m_vkQueueFamilyIndex;
+                    m_vkRuntimeQueueIndex = m_vkQueueIndex;
+
+                    VkQueue appQueue = VK_NULL_HANDLE;
+                    vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &appQueue);
+                    m_vkAppQueue = appQueue;
+                    m_vkRuntimeQueue = appQueue;
+
+                    // Step A: probe queueIndex + 1 first (zero cost).
+                    VkQueue probeQueue = VK_NULL_HANDLE;
+                    vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex + 1, &probeQueue);
+                    if (probeQueue != VK_NULL_HANDLE && probeQueue != appQueue) {
+                        m_vkRuntimeQueue = probeQueue;
+                        m_vkRuntimeQueueFamilyIndex = m_vkQueueFamilyIndex;
+                        m_vkRuntimeQueueIndex = m_vkQueueIndex + 1;
+                        m_queueIsolationSource = "probe";
+                    } else if (m_enable2QueueRewriteApplied &&
+                               m_enable2QueueRewriteFamily == m_vkQueueFamilyIndex) {
+                        // Step B: if xrCreateVulkanDeviceKHR rewrite succeeded for this
+                        // family, prefer queueIndex + 1 for the runtime thread.
+                        VkQueue rewrittenQueue = VK_NULL_HANDLE;
+                        vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex + 1, &rewrittenQueue);
+                        if (rewrittenQueue != VK_NULL_HANDLE && rewrittenQueue != appQueue) {
+                            m_vkRuntimeQueue = rewrittenQueue;
+                            m_vkRuntimeQueueFamilyIndex = m_vkQueueFamilyIndex;
+                            m_vkRuntimeQueueIndex = m_vkQueueIndex + 1;
+                            m_queueIsolationSource = "enable2_rewrite";
+                        } else {
+                            m_queueIsolationSource = "none";
+                        }
+                    } else {
+                        m_queueIsolationSource = "none";
+                    }
+
+                    Log(fmt::format(
+                        "Queue isolation result: source={} | appQueue={} (family={}, index={}) | rtQueue={} (family={}, index={})\n",
+                        m_queueIsolationSource,
+                        reinterpret_cast<void*>(m_vkAppQueue),
+                        m_vkQueueFamilyIndex,
+                        m_vkQueueIndex,
+                        reinterpret_cast<void*>(m_vkRuntimeQueue),
+                        m_vkRuntimeQueueFamilyIndex,
+                        m_vkRuntimeQueueIndex));
                 } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
                     Log("Game is using DX11\n");
                     m_apiType = GraphicsAPI::DX11;
@@ -1138,12 +1182,136 @@ namespace openxr_api_layer {
                     m_xrDestroySpace = reinterpret_cast<PFN_xrDestroySpace>(destroySpaceFn);
                 }
 
-                // Signal deferred construction of HoldingPen + RuntimeThread.
-                // Actual construction is deferred to first xrEndFrame once the
-                // injection swapchain and its images are available.
-                m_needHoldingPenInit = true;
+                const bool hasIsolatedQueue =
+                    (m_vkAppQueue != VK_NULL_HANDLE &&
+                     m_vkRuntimeQueue != VK_NULL_HANDLE &&
+                     m_vkAppQueue != m_vkRuntimeQueue);
+                m_phase3DecoupledAllowed = hasIsolatedQueue;
+
+                if (m_phase3DecoupledAllowed) {
+                    // Signal deferred construction of HoldingPen + RuntimeThread.
+                    // Actual construction is deferred to first xrEndFrame once the
+                    // injection swapchain and its images are available.
+                    m_needHoldingPenInit = true;
+                    Log(fmt::format(
+                        "Phase3 capability gate: enabled (source={}) | appQueue={} | rtQueue={} | enable2Intercepted={} | enable2RewriteApplied={}\n",
+                        m_queueIsolationSource,
+                        reinterpret_cast<void*>(m_vkAppQueue),
+                        reinterpret_cast<void*>(m_vkRuntimeQueue),
+                        m_enable2DeviceIntercepted,
+                        m_enable2QueueRewriteApplied));
+                    TraceLoggingWrite(g_traceProvider,
+                                      "Phase3_CapabilityGate",
+                                      TLArg(true, "DecoupledAllowed"),
+                                      TLArg(m_queueIsolationSource.c_str(), "Source"),
+                                      TLArg(reinterpret_cast<uint64_t>(m_vkAppQueue), "AppQueue"),
+                                      TLArg(reinterpret_cast<uint64_t>(m_vkRuntimeQueue), "RuntimeQueue"),
+                                      TLArg(m_vkQueueFamilyIndex, "AppQueueFamily"),
+                                      TLArg(m_vkQueueIndex, "AppQueueIndex"),
+                                      TLArg(m_vkRuntimeQueueFamilyIndex, "RuntimeQueueFamily"),
+                                      TLArg(m_vkRuntimeQueueIndex, "RuntimeQueueIndex"));
+                } else {
+                    // Safe fallback policy: passthrough mode when queue isolation
+                    // is not confirmed.
+                    m_needHoldingPenInit = false;
+                    Log(fmt::format(
+                        "Phase3 capability gate: passthrough (source={}) | appQueue={} | rtQueue={} | enable2Intercepted={} | enable2RewriteApplied={}\n",
+                        m_queueIsolationSource,
+                        reinterpret_cast<void*>(m_vkAppQueue),
+                        reinterpret_cast<void*>(m_vkRuntimeQueue),
+                        m_enable2DeviceIntercepted,
+                        m_enable2QueueRewriteApplied));
+                    TraceLoggingWrite(g_traceProvider,
+                                      "Phase3_CapabilityGate",
+                                      TLArg(false, "DecoupledAllowed"),
+                                      TLArg(m_queueIsolationSource.c_str(), "Source"),
+                                      TLArg(reinterpret_cast<uint64_t>(m_vkAppQueue), "AppQueue"),
+                                      TLArg(reinterpret_cast<uint64_t>(m_vkRuntimeQueue), "RuntimeQueue"),
+                                      TLArg(m_vkQueueFamilyIndex, "AppQueueFamily"),
+                                      TLArg(m_vkQueueIndex, "AppQueueIndex"),
+                                      TLArg(m_vkRuntimeQueueFamilyIndex, "RuntimeQueueFamily"),
+                                      TLArg(m_vkRuntimeQueueIndex, "RuntimeQueueIndex"));
+                }
             }
             return result;
+        }
+
+        XrResult xrCreateVulkanDeviceKHR(XrInstance instance,
+                                         const XrVulkanDeviceCreateInfoKHR* createInfo,
+                                         VkDevice* vulkanDevice,
+                                         VkResult* vulkanResult) override {
+            m_enable2DeviceIntercepted = true;
+            Log("xrCreateVulkanDeviceKHR intercepted.\n");
+
+            if (createInfo == nullptr || createInfo->vulkanCreateInfo == nullptr) {
+                return OpenXrApi::xrCreateVulkanDeviceKHR(instance, createInfo, vulkanDevice, vulkanResult);
+            }
+
+            // Build a writable copy so we can bump queueCount for single-queue
+            // families that can support at least 2 queues.
+            VkDeviceCreateInfo rewrittenCreateInfo = *createInfo->vulkanCreateInfo;
+            std::vector<VkDeviceQueueCreateInfo> queueInfos(
+                createInfo->vulkanCreateInfo->pQueueCreateInfos,
+                createInfo->vulkanCreateInfo->pQueueCreateInfos + createInfo->vulkanCreateInfo->queueCreateInfoCount);
+            std::vector<std::vector<float>> priorityStorage(queueInfos.size());
+
+            PFN_vkGetPhysicalDeviceQueueFamilyProperties getFamilyProps =
+                reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                    createInfo->pfnGetInstanceProcAddr(VK_NULL_HANDLE, "vkGetPhysicalDeviceQueueFamilyProperties"));
+
+            uint32_t familyCount = 0;
+            std::vector<VkQueueFamilyProperties> familyProps;
+            if (getFamilyProps != nullptr) {
+                getFamilyProps(createInfo->vulkanPhysicalDevice, &familyCount, nullptr);
+                familyProps.resize(familyCount);
+                if (familyCount > 0) {
+                    getFamilyProps(createInfo->vulkanPhysicalDevice, &familyCount, familyProps.data());
+                }
+            }
+
+            bool rewroteQueueCount = false;
+            for (size_t i = 0; i < queueInfos.size(); ++i) {
+                auto& q = queueInfos[i];
+                if (q.queueCount != 1) {
+                    continue;
+                }
+                if (q.queueFamilyIndex >= familyProps.size() ||
+                    familyProps[q.queueFamilyIndex].queueCount < 2) {
+                    continue;
+                }
+
+                const float basePriority = (q.pQueuePriorities != nullptr) ? q.pQueuePriorities[0] : 1.0f;
+                priorityStorage[i] = {basePriority, basePriority};
+                q.queueCount = 2;
+                q.pQueuePriorities = priorityStorage[i].data();
+                rewroteQueueCount = true;
+
+                m_enable2QueueRewriteFamily = q.queueFamilyIndex;
+            }
+
+            if (rewroteQueueCount) {
+                rewrittenCreateInfo.pQueueCreateInfos = queueInfos.data();
+                rewrittenCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
+                XrVulkanDeviceCreateInfoKHR rewrittenXrCreateInfo = *createInfo;
+                rewrittenXrCreateInfo.vulkanCreateInfo = &rewrittenCreateInfo;
+
+                const XrResult result =
+                    OpenXrApi::xrCreateVulkanDeviceKHR(instance, &rewrittenXrCreateInfo, vulkanDevice, vulkanResult);
+                if (XR_SUCCEEDED(result) && vulkanResult != nullptr && *vulkanResult == VK_SUCCESS) {
+                    m_enable2QueueRewriteApplied = true;
+                    Log(fmt::format("xrCreateVulkanDeviceKHR: bumped queueCount to 2 for family {}.\n",
+                                    m_enable2QueueRewriteFamily));
+                } else {
+                    Log(fmt::format("xrCreateVulkanDeviceKHR: queueCount rewrite attempted but device create failed (xr={}, vk={}).\n",
+                                    static_cast<int>(result),
+                                    (vulkanResult != nullptr) ? static_cast<int>(*vulkanResult) : 0));
+                }
+                return result;
+            }
+
+            Log("xrCreateVulkanDeviceKHR: no eligible single-queue family to rewrite.\n");
+
+            return OpenXrApi::xrCreateVulkanDeviceKHR(instance, createInfo, vulkanDevice, vulkanResult);
         }
 
         // 2. HOOK SWAPCHAIN CREATION
@@ -1176,8 +1344,10 @@ namespace openxr_api_layer {
 
                     // Initialize the processor
                     if (!m_processor && m_vkDevice != VK_NULL_HANDLE) {
-                        VkQueue queue;
-                        vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &queue);
+                        VkQueue queue = m_vkAppQueue;
+                        if (queue == VK_NULL_HANDLE) {
+                            vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &queue);
+                        }
                         auto processor = std::make_unique<VulkanFrameProcessor>(
                             m_vkPhysicalDevice, m_vkDevice, queue, m_vkQueueFamilyIndex);
                         if (processor->IsValid()) {
@@ -1210,6 +1380,14 @@ namespace openxr_api_layer {
                                             swapchain == m_frameBroker.GetPrimaryColorSwapchain();
 
                 if (isPrimaryColor && images != nullptr) {
+                    if (!m_phase3DecoupledAllowed) {
+                        // Capability gate fallback: do not substitute private images
+                        // when decoupled mode is disabled.
+                        m_frameBroker.RegisterSwapchainImages(swapchain, *imageCountOutput, images);
+                        Log(fmt::format("Mapped {} Vulkan images for primary swapchain (passthrough).\n",
+                                        *imageCountOutput));
+                        return result;
+                    }
                     // Phase 3: return layer-owned private images to the app so SteamVR's
                     // real swapchain images are never acquired/released from the app thread.
                     // This breaks the cycle where SteamVR holds released images indefinitely
@@ -1270,6 +1448,7 @@ namespace openxr_api_layer {
             // SteamVR has no knowledge of this swapchain being acquired, so it will
             // never block waiting for an xrEndFrame to recycle the image.
             if (!m_privateColorImages.empty() &&
+                m_phase3DecoupledAllowed &&
                 m_frameBroker.IsColorSwapchain(swapchain) &&
                 swapchain == m_frameBroker.GetPrimaryColorSwapchain()) {
                 *index = m_privateAcquireIndex %
@@ -1295,6 +1474,7 @@ namespace openxr_api_layer {
                 return OpenXrApi::xrWaitSwapchainImage(swapchain, waitInfo);
             }
             if (!m_privateColorImages.empty() &&
+                m_phase3DecoupledAllowed &&
                 m_frameBroker.IsColorSwapchain(swapchain) &&
                 swapchain == m_frameBroker.GetPrimaryColorSwapchain()) {
                 return XR_SUCCESS;
@@ -1313,6 +1493,7 @@ namespace openxr_api_layer {
         XrResult xrReleaseSwapchainImage(XrSwapchain swapchain,
                                           const XrSwapchainImageReleaseInfo* releaseInfo) override {
             const bool isPrimaryColor = !m_privateColorImages.empty() &&
+                                        m_phase3DecoupledAllowed &&
                                         m_frameBroker.IsColorSwapchain(swapchain) &&
                                         swapchain == m_frameBroker.GetPrimaryColorSwapchain();
 
@@ -1328,9 +1509,27 @@ namespace openxr_api_layer {
                         }
                         const XrTime displayTime =
                             m_runtimeThread ? m_runtimeThread->GetLastDisplayTime() : 0;
-                        m_holdingPen->SubmitCopy(colorImage,
-                                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                                  displayTime, pose);
+                        const uint64_t appFrameId = ++m_appEnqueueFrameId;
+                        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+                        const int64_t enqueueNs =
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+                        const bool enqueued = m_holdingPen->SubmitCopy(colorImage,
+                                                                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                                                        displayTime, pose);
+                        const uint64_t pending = m_holdingPen->GetPendingFrameCount();
+                        const uint64_t drops = m_holdingPen->GetDropCount();
+                        TraceLoggingWrite(g_traceProvider,
+                                          "Phase3_AppEnqueue",
+                                          TLArg(appFrameId, "AppFrameId"),
+                                          TLArg(displayTime, "DisplayTime"),
+                                          TLArg(enqueueNs, "EnqueueTimestampNs"),
+                                          TLArg(enqueued, "Enqueued"),
+                                          TLArg(pending, "PendingFrames"),
+                                          TLArg(drops, "DropCount"));
+                        if (!enqueued) {
+                            Log(fmt::format("Phase3 drop policy action: drop-newest (appFrameId={}, pending={}, drops={})\n",
+                                            appFrameId, pending, drops));
+                        }
                     }
                 }
                 // Private swapchain: SteamVR never acquired this image, so do NOT forward
@@ -1499,7 +1698,7 @@ namespace openxr_api_layer {
                 }
 
                 if (projectionLayer) {
-                    if (m_enableFrameRewrite) {
+                    if (m_enableFrameRewrite && m_phase3DecoupledAllowed) {
                         m_frameInjection.EnsureSwapchain(*this, session, m_frameBroker);
                         if (m_frameInjection.IsReady() && m_injectionVulkanImages.empty()) {
                             EnsureInjectionSwapchainImagesEnumerated();
@@ -1514,22 +1713,43 @@ namespace openxr_api_layer {
                                           TLArg(xr::ToCString(poseResult), "Result"));
                     }
 
-                    m_depthProvider.ExtractDepthInfo(*projectionLayer, m_frameContext);
-                    const bool hasDepthChain = m_frameContext.depthViews[0].valid || m_frameContext.depthViews[1].valid;
-                    if (!hasDepthChain && !m_depthWarningLogged) {
-                        m_depthWarningLogged = true;
-                        Log("[WARN] No XR_KHR_composition_layer_depth info on projection views; using tracked depth swapchains.\n");
-                    }
-
-                    if (hasDepthChain) {
-                        const auto& depthView = m_frameContext.depthViews[0].valid ? m_frameContext.depthViews[0] : m_frameContext.depthViews[1];
+                    if (m_phase3DecoupledAllowed) {
+                        bool appDepthChainPresent = false;
+                        for (uint32_t eye = 0; eye < projectionLayer->viewCount; ++eye) {
+                            if (projectionLayer->views[eye].next != nullptr) {
+                                appDepthChainPresent = true;
+                                break;
+                            }
+                        }
+                        if (appDepthChainPresent && !m_phase3DepthIgnoredLogged) {
+                            m_phase3DepthIgnoredLogged = true;
+                            Log("Phase3A color-only mode: ignoring projection depth chains in decoupled path.\n");
+                        }
                         TraceLoggingWrite(g_traceProvider,
-                                          "Depth_Metadata",
-                                          TLArg(depthView.minDepth, "MinDepth"),
-                                          TLArg(depthView.maxDepth, "MaxDepth"),
-                                          TLArg(depthView.nearZ, "NearZ"),
-                                          TLArg(depthView.farZ, "FarZ"),
-                                          TLArg(depthView.reversedZ, "ReversedZ"));
+                                          "Phase3_DepthIgnored",
+                                          TLArg(appDepthChainPresent, "AppDepthChainPresent"),
+                                          TLArg(true, "DecoupledColorOnly"));
+                    } else {
+                        m_depthProvider.ExtractDepthInfo(*projectionLayer, m_frameContext);
+                        const bool hasDepthChain =
+                            m_frameContext.depthViews[0].valid || m_frameContext.depthViews[1].valid;
+                        if (!hasDepthChain && !m_depthWarningLogged) {
+                            m_depthWarningLogged = true;
+                            Log("[WARN] No XR_KHR_composition_layer_depth info on projection views; using tracked depth swapchains.\n");
+                        }
+
+                        if (hasDepthChain) {
+                            const auto& depthView = m_frameContext.depthViews[0].valid
+                                                      ? m_frameContext.depthViews[0]
+                                                      : m_frameContext.depthViews[1];
+                            TraceLoggingWrite(g_traceProvider,
+                                              "Depth_Metadata",
+                                              TLArg(depthView.minDepth, "MinDepth"),
+                                              TLArg(depthView.maxDepth, "MaxDepth"),
+                                              TLArg(depthView.nearZ, "NearZ"),
+                                              TLArg(depthView.farZ, "FarZ"),
+                                              TLArg(depthView.reversedZ, "ReversedZ"));
+                        }
                     }
                 }
 
@@ -1660,9 +1880,16 @@ namespace openxr_api_layer {
                 m_xrDestroySpace(m_localSpace);
                 m_localSpace = XR_NULL_HANDLE;
             }
+            if (m_vkDevice != VK_NULL_HANDLE) {
+                const VkResult idleResult = vkDeviceWaitIdle(m_vkDevice);
+                if (idleResult != VK_SUCCESS) {
+                    Log(fmt::format("[WARN] TeardownPhase3Resources: vkDeviceWaitIdle returned {}\n",
+                                    static_cast<int>(idleResult)));
+                }
+            }
             m_processor.reset();
             // Destroy private color images (must be after GPU is idle — HoldingPen
-            // DrainAndDestroy above calls vkQueueWaitIdle, so we're safe here).
+            // and runtime queue work. vkDeviceWaitIdle above guarantees this.
             if (m_vkDevice != VK_NULL_HANDLE) {
                 for (uint32_t i = 0; i < static_cast<uint32_t>(m_privateColorImages.size()); ++i) {
                     if (m_privateColorImages[i] != VK_NULL_HANDLE) {
@@ -1677,6 +1904,14 @@ namespace openxr_api_layer {
             m_privateColorMemories.clear();
             m_privateAcquireIndex = 0;
             m_syntheticDisplayTime = 0;
+            m_vkAppQueue = VK_NULL_HANDLE;
+            m_vkRuntimeQueue = VK_NULL_HANDLE;
+            m_vkRuntimeQueueFamilyIndex = 0;
+            m_vkRuntimeQueueIndex = 0;
+            m_queueIsolationSource = "none";
+            m_phase3DecoupledAllowed = false;
+            m_phase3DepthIgnoredLogged = false;
+            m_appEnqueueFrameId = 0;
             m_session = XR_NULL_HANDLE;
             m_needHoldingPenInit = false;
         }
@@ -1686,6 +1921,7 @@ namespace openxr_api_layer {
         // and its images are enumerated. Safe to call every frame — exits immediately
         // once initialized.
         void EnsureHoldingPenAndRuntimeThread() {
+            if (!m_phase3DecoupledAllowed) return;
             if (!m_needHoldingPenInit || m_holdingPen) return;
             if (!m_frameInjection.IsReady()) return;
             if (m_injectionVulkanImages.empty()) return;
@@ -1699,9 +1935,15 @@ namespace openxr_api_layer {
             if (!infoOpt) return;
             const VkFormat fmt = static_cast<VkFormat>(infoOpt->format);
 
-            VkQueue queue = VK_NULL_HANDLE;
-            vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &queue);
-            if (queue == VK_NULL_HANDLE) return;
+            VkQueue appQueue = m_vkAppQueue;
+            if (appQueue == VK_NULL_HANDLE) {
+                vkGetDeviceQueue(m_vkDevice, m_vkQueueFamilyIndex, m_vkQueueIndex, &appQueue);
+            }
+            VkQueue runtimeQueue = m_vkRuntimeQueue;
+            if (runtimeQueue == VK_NULL_HANDLE) {
+                vkGetDeviceQueue(m_vkDevice, m_vkRuntimeQueueFamilyIndex, m_vkRuntimeQueueIndex, &runtimeQueue);
+            }
+            if (appQueue == VK_NULL_HANDLE || runtimeQueue == VK_NULL_HANDLE) return;
 
             // Create the local XrSpace used by RuntimeThread for projection layers.
             XrReferenceSpaceCreateInfo spaceCI{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
@@ -1716,7 +1958,7 @@ namespace openxr_api_layer {
             try {
                 m_holdingPen = std::make_unique<HoldingPen>(
                     m_vkPhysicalDevice, m_vkDevice,
-                    queue, m_vkQueueFamilyIndex, m_vkQueueFamilyIndex,
+                    appQueue, m_vkQueueFamilyIndex, m_vkRuntimeQueueFamilyIndex,
                     w, h, fmt);
 
                 m_runtimeThread = std::make_unique<RuntimeThread>(
@@ -1726,8 +1968,8 @@ namespace openxr_api_layer {
                     m_injectionVulkanImages,
                     m_localSpace,
                     m_vkDevice,
-                    queue,
-                    m_vkQueueFamilyIndex,
+                    runtimeQueue,
+                    m_vkRuntimeQueueFamilyIndex,
                     w, h,
                     m_xrBeginFrame,
                     m_xrWaitSwapchainImage,
@@ -1837,8 +2079,19 @@ namespace openxr_api_layer {
         VkInstance m_vkInstance{VK_NULL_HANDLE};
         VkPhysicalDevice m_vkPhysicalDevice{VK_NULL_HANDLE};
         VkDevice m_vkDevice{VK_NULL_HANDLE};
+        VkQueue m_vkAppQueue{VK_NULL_HANDLE};
+        VkQueue m_vkRuntimeQueue{VK_NULL_HANDLE};
         uint32_t m_vkQueueFamilyIndex{0};
         uint32_t m_vkQueueIndex{0};
+        uint32_t m_vkRuntimeQueueFamilyIndex{0};
+        uint32_t m_vkRuntimeQueueIndex{0};
+        bool m_enable2DeviceIntercepted{false};
+        bool m_enable2QueueRewriteApplied{false};
+        uint32_t m_enable2QueueRewriteFamily{0};
+        std::string m_queueIsolationSource{"none"};
+        bool m_phase3DecoupledAllowed{false};
+        bool m_phase3DepthIgnoredLogged{false};
+        uint64_t m_appEnqueueFrameId{0};
         std::vector<VkImage> m_injectionVulkanImages;
 
         // Private color images owned by the layer — returned to the app instead of
@@ -1877,7 +2130,7 @@ namespace openxr_api_layer {
         // In Phase 3 (pending or active), the app thread's xrBeginFrame is always a
         // noop — RuntimeThread exclusively owns the real compositor xrBeginFrame.
         XrResult xrBeginFrame_app(XrSession session, const XrFrameBeginInfo* frameBeginInfo) {
-            if (session == m_session && (m_runtimeThread || m_needHoldingPenInit)) {
+            if (session == m_session && m_phase3DecoupledAllowed && (m_runtimeThread || m_needHoldingPenInit)) {
                 // Phase 3 active or pending — app thread never touches the real compositor.
                 return XR_SUCCESS;
             }

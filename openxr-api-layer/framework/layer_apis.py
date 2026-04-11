@@ -2,6 +2,7 @@
 override_functions = [
     "xrGetSystem",
     "xrCreateSession",
+    "xrCreateVulkanDeviceKHR",
     "xrDestroySession",
     "xrCreateSwapchain",
     "xrEnumerateSwapchainImages",
@@ -25,4 +26,6 @@ requested_functions = [
 ]
 
 # The list of OpenXR extensions our layer will either override or use.
-extensions = []
+extensions = [
+    "XR_KHR_vulkan_enable2",
+]

@@ -171,10 +171,10 @@ void HoldingPen::AllocateImage(VkImage& outImage, VkDeviceMemory& outMemory,
 // SubmitCopy (app thread)
 // ---------------------------------------------------------------------------
 
-void HoldingPen::SubmitCopy(VkImage appColorImage,
-                             VkImageLayout appColorLayout,
-                             XrTime displayTime,
-                             XrPosef renderPose) {
+bool HoldingPen::SubmitCopy(VkImage appColorImage,
+                            VkImageLayout appColorLayout,
+                            XrTime displayTime,
+                            XrPosef renderPose) {
     // Find a consumed (available) slot. Rotate through the ring.
     int chosenSlot = -1;
     for (int attempt = 0; attempt < kSlotCount; ++attempt) {
@@ -189,7 +189,8 @@ void HoldingPen::SubmitCopy(VkImage appColorImage,
         // All slots in use — drop this frame rather than racing with an
         // in-flight GPU read on slot 0.
         Log("HoldingPen::SubmitCopy: all slots busy, dropping frame.\n");
-        return;
+        m_dropCount.fetch_add(1, std::memory_order_release);
+        return false;
     }
 
     Slot& s = m_slots[chosenSlot];
@@ -287,8 +288,11 @@ void HoldingPen::SubmitCopy(VkImage appColorImage,
         CHECK_VK(vkQueueSubmit(m_appQueue, 1, &submitInfo, VK_NULL_HANDLE));
     }
 
-    s.meta = {displayTime, renderPose};
+    const uint64_t frameId = m_nextFrameId++;
+    s.meta = {frameId, displayTime, renderPose};
+    m_latestSubmittedFrameId.store(frameId, std::memory_order_release);
     m_latestReadySlot.store(chosenSlot, std::memory_order_release);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +306,7 @@ std::optional<HoldingPen::ReadySlot> HoldingPen::ConsumeLatest() {
     }
     m_lastConsumedSlot = latest;
     const Slot& s = m_slots[latest];
+    m_lastConsumedFrameId.store(s.meta.frameId, std::memory_order_release);
     return ReadySlot{latest, s.copyDone, s.image, s.meta};
 }
 

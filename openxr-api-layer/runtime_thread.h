@@ -112,7 +112,8 @@ class RuntimeThread {
                          VkImage sourceImage,
                          VkSemaphore waitSemaphore,
                          XrPosef pose,
-                         VkFence consumedFence = VK_NULL_HANDLE);
+                         VkFence consumedFence = VK_NULL_HANDLE,
+                         uint64_t sourceFrameId = 0);
 
     // Path B: submit the last cached frame (Phase 3 stub — no CUDA warp yet).
     void SubmitCachedFrame(XrTime displayTime);
