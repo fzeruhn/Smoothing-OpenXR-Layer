@@ -103,7 +103,7 @@ stereo-adapter-test/ Stereo vector adaptation test
 hole-fill-test/      Push-pull hole filling test
 pose-warp-test/      Pose warp checkerboard test
 external/            OpenXR-SDK, OpenXR-SDK-Source, OpenXR-MixedReality (submodules); PVR/ (Pimax SDK)
-scripts/             Install-Layer.ps1, Uninstall-Layer.ps1, Tracing.wprp
+scripts/             Install-Layer.ps1, Uninstall-Layer.ps1, Reinstall-Layer.ps1, Tracing.wprp
 ```
 
 New systems go in **new dedicated files**, not `layer.cpp`. `layer.cpp` stays focused on OpenXR hook implementations that delegate to subsystem classes.
@@ -172,7 +172,23 @@ bin\x64\Debug\stereo-adapter-test.exe # Stereo vector adaptation
 ```powershell
 .\scripts\Install-Layer.ps1    # Register with OpenXR loader
 .\scripts\Uninstall-Layer.ps1  # Unregister
+.\scripts\Reinstall-Layer.ps1  # Uninstall+Install in one elevated pass
 ```
 Layer descriptor JSONs: `openxr-api-layer/openxr-api-layer.json` (x64) and `openxr-api-layer/openxr-api-layer-32.json` (x86).
+
+**hello_xr validation workflow (preferred for current Phase 3 work):**
+```powershell
+# hello_xr executable + required renderer arg
+& "C:\Project\OpenXR-SDK-Source\build\src\tests\hello_xr\Debug\hello_xr.exe" -g vulkan
+```
+- Baseline run is **optional** (use when comparing regressions or validating install-state assumptions), not required for every iteration.
+- Layer run: install layer, then execute the same command and compare behavior.
+- Timeout rule: do not let `hello_xr` run indefinitely in automation. If it does not exit within a reasonable window (eg. 60-90s), terminate it programmatically and treat as `TIMEOUT/HANG` for that test pass.
+- Layer log tail command:
+```powershell
+Get-Content "$env:LOCALAPPDATA\SMOOTHING-OPENXR-LAYER\SMOOTHING-OPENXR-LAYER.log" -Tail 40
+```
+- Treat `hello_xr` console output as low-signal; use the layer log + trace events as primary diagnostics.
+- Install script caveat: `Install-Layer.ps1` prefers `openxr-api-layer.json` next to the script, then `..\bin\x64\Release\openxr-api-layer.json`. Running `scripts\Reinstall-Layer.ps1` from repo root checks Debug first, then Release.
 
 **Tracing:** Use `scripts/Tracing.wprp` with WPR. The layer emits TraceLogging events via `framework/log.h` macros.

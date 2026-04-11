@@ -1,5 +1,14 @@
 [shell_environment_policy]
-inherit = "core"
+# 'core' is too restrictive for Visual Studio projects. Use 'all' 
+# to ensure MSBuild can see necessary system drivers.
+inherit = "all" 
 
+# Clear out the old conflicting manual PATH injection
+# and use a cleaner environment variable setup.
 [shell_environment_policy.set]
-PATH = "/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin:/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64:${PATH}"
+COMSPEC = "C:\\Windows\\System32\\cmd.exe"
+PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW"
+# SystemRoot and windir are often missing in the internal container; 
+# injecting them manually fixes 90% of "host failed" errors.
+SystemRoot = "C:\\Windows"
+windir = "C:\\Windows"
